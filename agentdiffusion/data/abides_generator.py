@@ -25,49 +25,50 @@ _TYPE_MAP = {
 
 
 # ---- Normalization constants ----
-# All values are scaled to roughly [-1, 1] or [0, 1] range
-_CASH_SCALE = 100_000.0   # starting_cash = 10M cents = $100K
-_POSITION_SCALE = 1000.0  # max typical position in shares
 _PRICE_SCALE = 100_000.0  # r_bar = 100000 cents = $1000
-_ORDER_SCALE = 100.0       # typical max orders
+_CLIP = 5.0               # hard clamp all dims to [-5, 5]
+
+
+def _safe_div(a: float, b: float) -> float:
+    """Division with safe denominator, clipped to [-_CLIP, _CLIP]."""
+    return np.clip(a / max(abs(b), 1e-6), -_CLIP, _CLIP)
 
 
 def _extract_agent_state(agent, L1_prices: dict, step_idx: int, total_steps: int) -> np.ndarray:
     """Extract 128-dim normalized state vector from a single ABIDES TradingAgent.
 
-    All dimensions are scaled to approximately [-3, 3] range via known scales.
+    ALL dimensions are hard-clipped to [-5, 5]. No unbounded values.
     """
     state = np.zeros(128, dtype=np.float32)
     h = agent.holdings
     mid_price = L1_prices.get("mid", _PRICE_SCALE) or _PRICE_SCALE
-
-    # [0:32] 持仓信息 — normalized by position scale
-    state[0] = h.get("ABM", 0) / _POSITION_SCALE
-    # Cash as fraction of starting cash
-    starting = getattr(agent, "starting_cash", 10_000_000)
+    starting = max(getattr(agent, "starting_cash", 10_000_000), 1)
     cash_raw = h.get("CASH", 0)
-    state[1] = cash_raw / max(starting, 1)  # relative cash [~0.5 to ~1.5]
-    # Position value relative to cash
-    state[2] = (h.get("ABM", 0) * mid_price) / max(abs(cash_raw), 1)  # leverage proxy
+    position = h.get("ABM", 0)
 
-    # [32:48] 资金状态 — all relative
-    state[32] = cash_raw / max(starting, 1)           # relative cash
-    state[33] = 1.0                                    # starting cash = 1.0 (reference)
-    state[34] = abs(state[2])                          # leverage = |pos_value / cash|
-    state[35] = (cash_raw - starting) / max(starting, 1)  # PnL ratio
+    # [0:32] 持仓信息 — signed log scale for positions, relative for cash
+    state[0] = np.sign(position) * np.log1p(abs(position))  # signed log, ~[-7, 7] then clip
+    state[1] = _safe_div(cash_raw, starting)                 # relative cash ~[0.5, 1.5]
+    state[2] = _safe_div(position * mid_price, max(abs(cash_raw), starting * 0.01))  # leverage
 
-    # [48:64] 策略参数 — one-hot + normalized params
+    # [32:48] 资金状态
+    state[32] = state[1]                                   # relative cash (same as [1])
+    state[33] = _safe_div(cash_raw - starting, starting)   # PnL ratio
+    state[34] = np.clip(abs(state[2]), 0, _CLIP)           # |leverage|
+    state[35] = np.tanh((cash_raw - starting) / starting)  # squashed PnL
+
+    # [48:64] 策略参数 — one-hot + squashed params
     atype = _TYPE_MAP.get(type(agent).__name__, AgentType.NOISE_TRADER)
     state[48 + int(atype)] = 1.0  # one-hot [48:52]
 
     if hasattr(agent, "lambda_a"):
-        state[52] = np.tanh(agent.lambda_a * 1e12)  # squash to [-1, 1]
+        state[52] = np.tanh(agent.lambda_a * 1e12)
     if hasattr(agent, "kappa"):
         state[53] = np.tanh(agent.kappa * 1e15)
     if hasattr(agent, "r_bar"):
         state[54] = agent.r_bar / _PRICE_SCALE  # ~1.0
 
-    # [64:80] 历史统计 — already small scale
+    # [64:80] 历史统计
     exec_orders = getattr(agent, "executed_orders", [])
     if exec_orders:
         prices_exec = [o.fill_price for o in exec_orders if hasattr(o, "fill_price") and o.fill_price]
@@ -75,27 +76,28 @@ def _extract_agent_state(agent, L1_prices: dict, step_idx: int, total_steps: int
             returns = np.diff(np.log(np.array(prices_exec, dtype=float).clip(min=1)))
             state[64] = np.clip(returns.mean(), -1, 1)
             state[65] = np.clip(returns.std(), 0, 1)
-            state[66] = np.clip(state[64] / (state[65] + 1e-8), -3, 3)  # sharpe
-        state[67] = len(exec_orders) / _ORDER_SCALE  # normalized count
+            state[66] = np.clip(state[64] / (state[65] + 1e-8), -3, 3)
+        state[67] = np.tanh(len(exec_orders) / 50.0)  # squashed count
 
-    # [80:96] 行为特征 — normalized counts + progress
-    state[80] = len(getattr(agent, "orders", {})) / 10.0  # active orders
-    state[81] = len(exec_orders) / _ORDER_SCALE
-    state[82] = step_idx / max(total_steps, 1)              # time [0, 1]
+    # [80:96] 行为特征
+    state[80] = np.tanh(len(getattr(agent, "orders", {})) / 5.0)
+    state[81] = state[67]  # same as exec count
+    state[82] = step_idx / max(total_steps, 1)  # time [0, 1]
 
-    # [96:112] 市场观察 — relative to mid price
+    # [96:112] 市场观察 — centered around 1.0
     bid = L1_prices.get("bid", mid_price) or mid_price
     ask = L1_prices.get("ask", mid_price) or mid_price
-    spread = ask - bid
-    state[96] = bid / _PRICE_SCALE                    # ~1.0
-    state[97] = ask / _PRICE_SCALE                    # ~1.0
-    state[98] = mid_price / _PRICE_SCALE              # ~1.0
-    state[99] = spread / _PRICE_SCALE * 100           # spread in bps-like scale
+    state[96] = bid / _PRICE_SCALE              # ~1.0
+    state[97] = ask / _PRICE_SCALE              # ~1.0
+    state[98] = mid_price / _PRICE_SCALE        # ~1.0
+    state[99] = (ask - bid) / mid_price * 1000  # spread in ‰ (per mille)
     state[100] = (mid_price - _PRICE_SCALE) / _PRICE_SCALE  # deviation from par
 
     # [112:128] 社交/信息
-    state[112] = float(atype) / 4.0  # type [0, 0.75]
-    state[113] = np.random.randn() * 0.1  # noise placeholder
+    state[112] = float(atype) / 3.0  # type [0, 1]
+
+    # HARD CLIP everything
+    np.clip(state, -_CLIP, _CLIP, out=state)
 
     return state
 
