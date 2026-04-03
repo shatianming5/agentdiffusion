@@ -288,18 +288,32 @@ class LeWorldModel(nn.Module):
         # Prediction loss: MSE in latent space
         loss_pred = F.mse_loss(z_t1_pred, z_t1)
 
-        # SIGReg on the concatenation of all embeddings in the batch
-        # (regularize both z_t and z_t1 jointly)
+        # --- Anti-collapse regularization (VICReg-style + SIGReg) ---
         z_all = torch.cat([z_t, z_t1], dim=0)  # [2B, d_latent]
+
+        # 1) Variance: per-dim std must be >= 1 (hinge loss)
+        z_std = z_all.std(dim=0)  # [d_latent]
+        loss_var = F.relu(1.0 - z_std).mean()
+
+        # 2) Covariance: off-diagonal of cov matrix should be zero
+        z_centered = z_all - z_all.mean(dim=0)
+        cov = (z_centered.T @ z_centered) / max(z_all.shape[0] - 1, 1)
+        off_diag = cov - torch.diag(cov.diag())
+        loss_cov = (off_diag.pow(2)).mean()
+
+        # 3) SIGReg (original)
         loss_sigreg = self.sigreg(z_all)
 
+        # Combined regularization
+        loss_reg = loss_var * 25.0 + loss_cov * 1.0 + loss_sigreg * self.lambda_sigreg
+
         # Total loss
-        loss_total = loss_pred + self.lambda_sigreg * loss_sigreg
+        loss_total = loss_pred + loss_reg
 
         return LeWMLossOutput(
             loss_total=loss_total,
             loss_pred=loss_pred,
-            loss_sigreg=loss_sigreg,
+            loss_sigreg=loss_reg,  # report combined reg loss
             z_t=z_t,
             z_t1_target=z_t1,
             z_t1_pred=z_t1_pred,
