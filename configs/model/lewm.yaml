@@ -1,0 +1,32 @@
+agent:
+  raw_dim: 128
+  latent_dim: 16   # kept for compatibility but not used by lewm encoder
+  agent_types: 4
+
+patch:
+  patch_size: 4
+  grid_h: 34
+  grid_w: 33
+
+# LeWorldModel architecture (~15M params total)
+lewm:
+  # Encoder (ViT-tiny, ~5.6M params)
+  d_enc: 256
+  d_latent: 256
+  enc_depth: 6
+  enc_heads: 8
+  enc_mlp_ratio: 4.0
+
+  # Predictor (Transformer, ~9.5M params)
+  d_pred: 384
+  d_cond: 32
+  pred_depth: 6
+  pred_heads: 8
+  pred_mlp_ratio: 2.0
+
+  # General
+  dropout: 0.0
+
+  # SIGReg regularization
+  num_projections: 512
+  lambda_sigreg: 0.1

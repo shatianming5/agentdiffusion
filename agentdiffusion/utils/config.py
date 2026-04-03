@@ -76,6 +76,24 @@ class DataConfig:
 
 
 @dataclass
+class LeWMConfig:
+    """LeWorldModel (JEPA) architecture configuration."""
+    d_enc: int = 256
+    d_latent: int = 256
+    d_pred: int = 384
+    d_cond: int = 32
+    enc_depth: int = 6
+    enc_heads: int = 8
+    pred_depth: int = 6
+    pred_heads: int = 8
+    enc_mlp_ratio: float = 4.0
+    pred_mlp_ratio: float = 2.0
+    dropout: float = 0.0
+    num_projections: int = 512
+    lambda_sigreg: float = 0.1
+
+
+@dataclass
 class AgentDiffusionConfig:
     agent: AgentStateConfig = field(default_factory=AgentStateConfig)
     patch: PatchConfig = field(default_factory=PatchConfig)
@@ -84,6 +102,7 @@ class AgentDiffusionConfig:
     constraint: ConstraintConfig = field(default_factory=ConstraintConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    lewm: LeWMConfig = field(default_factory=LeWMConfig)
     seed: int = 42
     output_dir: str = "outputs"
 
