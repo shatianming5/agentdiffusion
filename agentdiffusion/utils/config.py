@@ -90,7 +90,14 @@ class LeWMConfig:
     pred_mlp_ratio: float = 2.0
     dropout: float = 0.0
     num_projections: int = 512
-    lambda_sigreg: float = 0.1
+    lambda_sigreg: float = 5.0
+    # Decoder
+    use_decoder: bool = False
+    d_dec: int = 256
+    dec_depth: int = 4
+    dec_heads: int = 4
+    dec_mlp_ratio: float = 4.0
+    lambda_recon: float = 1.0
 
 
 @dataclass
