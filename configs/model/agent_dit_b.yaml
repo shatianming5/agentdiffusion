@@ -1,0 +1,32 @@
+agent:
+  raw_dim: 128
+  latent_dim: 16
+  agent_types: 4
+
+patch:
+  patch_size: 4
+  grid_h: 100
+  grid_w: 100
+
+model:
+  d_model: 512
+  depth: 12
+  heads: 8
+  mlp_ratio: 4.0
+  num_market_tokens: 128
+  local_window_size: 8
+  dropout: 0.0
+
+diffusion:
+  timesteps: 1000
+  beta_schedule: cosine
+  prediction_type: v_prediction
+  ddim_steps: 50
+
+constraint:
+  lambda_clearing: 1.0
+  lambda_budget: 0.5
+  lambda_conservation: 1.0
+  guidance_scale_clearing: 2.0
+  guidance_scale_budget: 1.0
+  guidance_start_ratio: 0.5

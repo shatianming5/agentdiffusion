@@ -1,0 +1,24 @@
+agent:
+  raw_dim: 128
+  latent_dim: 16
+
+train:
+  batch_size: 4096
+  lr: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  total_steps: 50000
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  mixed_precision: bf16
+  log_every: 100
+  save_every: 5000
+  eval_every: 1000
+
+data:
+  data_dir: data/abides_small
+  num_workers: 4
+  pin_memory: true
+
+seed: 42
+output_dir: outputs/stage1_ae

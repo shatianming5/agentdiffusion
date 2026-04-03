@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+vendor/
+data/
+outputs/
+*.pt
+*.ckpt
+*.egg-info/
+dist/
+build/
+.DS_Store
+wandb/
+*.log
+log/

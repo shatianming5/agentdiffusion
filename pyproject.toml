@@ -1,0 +1,29 @@
+[project]
+name = "agentdiffusion"
+version = "0.1.0"
+description = "Accelerating Million-Scale Agent-Based Financial Market Simulation with Latent Diffusion Models"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2.0",
+    "einops>=0.7.0",
+    "scipy>=1.12.0",
+    "numpy>=1.26.0",
+    "hydra-core>=1.3.0",
+    "omegaconf>=2.3.0",
+    "wandb>=0.16.0",
+    "accelerate>=0.27.0",
+    "tqdm>=4.66.0",
+    "matplotlib>=3.8.0",
+]
+
+[project.optional-dependencies]
+flash = ["flash-attn>=2.5.0"]
+abides = ["abides-core>=0.2.0"]
+dev = ["pytest>=8.0.0", "ruff>=0.3.0"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[tool.setuptools.packages.find]
+include = ["agentdiffusion*"]
