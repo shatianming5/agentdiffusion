@@ -24,59 +24,78 @@ _TYPE_MAP = {
 }
 
 
+# ---- Normalization constants ----
+# All values are scaled to roughly [-1, 1] or [0, 1] range
+_CASH_SCALE = 100_000.0   # starting_cash = 10M cents = $100K
+_POSITION_SCALE = 1000.0  # max typical position in shares
+_PRICE_SCALE = 100_000.0  # r_bar = 100000 cents = $1000
+_ORDER_SCALE = 100.0       # typical max orders
+
+
 def _extract_agent_state(agent, L1_prices: dict, step_idx: int, total_steps: int) -> np.ndarray:
-    """Extract 128-dim state vector from a single ABIDES TradingAgent."""
+    """Extract 128-dim normalized state vector from a single ABIDES TradingAgent.
+
+    All dimensions are scaled to approximately [-3, 3] range via known scales.
+    """
     state = np.zeros(128, dtype=np.float32)
     h = agent.holdings
+    mid_price = L1_prices.get("mid", _PRICE_SCALE) or _PRICE_SCALE
 
-    # [0:32] 持仓信息
-    state[0] = h.get("ABM", 0)
-    state[1] = h.get("CASH", 0) / 100.0  # cents -> dollars
+    # [0:32] 持仓信息 — normalized by position scale
+    state[0] = h.get("ABM", 0) / _POSITION_SCALE
+    # Cash as fraction of starting cash
+    starting = getattr(agent, "starting_cash", 10_000_000)
+    cash_raw = h.get("CASH", 0)
+    state[1] = cash_raw / max(starting, 1)  # relative cash [~0.5 to ~1.5]
+    # Position value relative to cash
+    state[2] = (h.get("ABM", 0) * mid_price) / max(abs(cash_raw), 1)  # leverage proxy
 
-    # [32:48] 资金状态
-    state[32] = h.get("CASH", 0) / 100.0
-    state[33] = getattr(agent, "starting_cash", 100000) / 100.0
-    # 杠杆 = |持仓价值| / 现金
-    pos_val = abs(state[0]) * L1_prices.get("mid", 1000.0)
-    cash = max(abs(state[32]), 1.0)
-    state[34] = pos_val / cash
+    # [32:48] 资金状态 — all relative
+    state[32] = cash_raw / max(starting, 1)           # relative cash
+    state[33] = 1.0                                    # starting cash = 1.0 (reference)
+    state[34] = abs(state[2])                          # leverage = |pos_value / cash|
+    state[35] = (cash_raw - starting) / max(starting, 1)  # PnL ratio
 
-    # [48:64] 策略参数（类型编码 + agent 特有参数）
+    # [48:64] 策略参数 — one-hot + normalized params
     atype = _TYPE_MAP.get(type(agent).__name__, AgentType.NOISE_TRADER)
-    state[48 + int(atype)] = 1.0  # one-hot encoding
+    state[48 + int(atype)] = 1.0  # one-hot [48:52]
 
     if hasattr(agent, "lambda_a"):
-        state[52] = agent.lambda_a * 1e12  # scale to reasonable range
+        state[52] = np.tanh(agent.lambda_a * 1e12)  # squash to [-1, 1]
     if hasattr(agent, "kappa"):
-        state[53] = agent.kappa * 1e15
+        state[53] = np.tanh(agent.kappa * 1e15)
     if hasattr(agent, "r_bar"):
-        state[54] = agent.r_bar / 100000.0  # normalize
+        state[54] = agent.r_bar / _PRICE_SCALE  # ~1.0
 
-    # [64:80] 历史统计
+    # [64:80] 历史统计 — already small scale
     exec_orders = getattr(agent, "executed_orders", [])
     if exec_orders:
         prices_exec = [o.fill_price for o in exec_orders if hasattr(o, "fill_price") and o.fill_price]
         if len(prices_exec) >= 2:
             returns = np.diff(np.log(np.array(prices_exec, dtype=float).clip(min=1)))
-            state[64] = returns.mean() if len(returns) > 0 else 0  # mean return
-            state[65] = returns.std() if len(returns) > 1 else 0   # volatility
-            state[66] = state[64] / (state[65] + 1e-10)           # sharpe
-        state[67] = len(exec_orders)  # total executions
+            state[64] = np.clip(returns.mean(), -1, 1)
+            state[65] = np.clip(returns.std(), 0, 1)
+            state[66] = np.clip(state[64] / (state[65] + 1e-8), -3, 3)  # sharpe
+        state[67] = len(exec_orders) / _ORDER_SCALE  # normalized count
 
-    # [80:96] 行为特征
-    state[80] = len(getattr(agent, "orders", {}))     # active orders
-    state[81] = len(exec_orders)                       # executed orders
-    state[82] = step_idx / max(total_steps, 1)         # time progress
+    # [80:96] 行为特征 — normalized counts + progress
+    state[80] = len(getattr(agent, "orders", {})) / 10.0  # active orders
+    state[81] = len(exec_orders) / _ORDER_SCALE
+    state[82] = step_idx / max(total_steps, 1)              # time [0, 1]
 
-    # [96:112] 市场观察
-    state[96] = L1_prices.get("bid", 0) / 100000.0
-    state[97] = L1_prices.get("ask", 0) / 100000.0
-    state[98] = L1_prices.get("mid", 0) / 100000.0
-    state[99] = L1_prices.get("spread", 0) / 100000.0
-    state[100] = L1_prices.get("last_trade", 0) / 100000.0
+    # [96:112] 市场观察 — relative to mid price
+    bid = L1_prices.get("bid", mid_price) or mid_price
+    ask = L1_prices.get("ask", mid_price) or mid_price
+    spread = ask - bid
+    state[96] = bid / _PRICE_SCALE                    # ~1.0
+    state[97] = ask / _PRICE_SCALE                    # ~1.0
+    state[98] = mid_price / _PRICE_SCALE              # ~1.0
+    state[99] = spread / _PRICE_SCALE * 100           # spread in bps-like scale
+    state[100] = (mid_price - _PRICE_SCALE) / _PRICE_SCALE  # deviation from par
 
-    # [112:128] 社交/信息 (基础版本使用噪声填充)
-    state[112] = float(atype) / 4.0  # type as continuous
+    # [112:128] 社交/信息
+    state[112] = float(atype) / 4.0  # type [0, 0.75]
+    state[113] = np.random.randn() * 0.1  # noise placeholder
 
     return state
 
