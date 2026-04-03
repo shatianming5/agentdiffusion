@@ -1,16 +1,17 @@
 """LeWorldModel: JEPA-based world model for agent-based financial simulation.
 
 Combines a ViT encoder and Transformer predictor with SIGReg regularization
-for learning next-state prediction in latent space.
+for learning next-state prediction in latent space. Optionally includes a
+Transformer decoder for reconstructing raw agent grids from latent vectors.
 
 Reference: arXiv:2603.19312 (Le World Model)
 
-Training objective:
-    L_total = L_pred + lambda_sigreg * L_sigreg
+Training objective (with decoder):
+    L_total = L_pred + lambda_sigreg * L_reg + lambda_recon * L_recon
 
     L_pred:   MSE between predicted and target latent embeddings
-    L_sigreg: SIGReg (Stochastic Independence via Gaussian Regularization)
-              using random projections and the Epps-Pulley normality test
+    L_reg:    VICReg-style variance/covariance + SIGReg regularization
+    L_recon:  MSE between decoded encoder output and original state (raw space)
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ import torch.nn.functional as F
 
 from .lewm_encoder import LeWMEncoder
 from .lewm_predictor import LeWMPredictor
+from .lewm_decoder import LeWMDecoder
 
 
 @dataclass
@@ -32,6 +34,7 @@ class LeWMLossOutput:
     loss_total: torch.Tensor
     loss_pred: torch.Tensor
     loss_sigreg: torch.Tensor
+    loss_recon: torch.Tensor | None
     z_t: torch.Tensor
     z_t1_target: torch.Tensor
     z_t1_pred: torch.Tensor
@@ -156,11 +159,16 @@ class SIGReg(nn.Module):
 
 
 class LeWorldModel(nn.Module):
-    """Full LeWorldModel: Encoder + Predictor + SIGReg.
+    """Full LeWorldModel: Encoder + Predictor + SIGReg + optional Decoder.
 
     End-to-end trainable world model that learns to predict next
     agent grid states in latent space. No EMA, no stop-gradient,
     no pre-trained encoder -- trained from scratch.
+
+    When use_decoder=True, includes a Transformer decoder that maps
+    latent vectors back to raw agent grids, enabling:
+    - Reconstruction loss (L_recon) for better encoder grounding
+    - Latent-to-raw-space rollout and evaluation
 
     Args:
         d_agent: Per-agent raw feature dimension (128).
@@ -177,7 +185,15 @@ class LeWorldModel(nn.Module):
         pred_mlp_ratio: FFN expansion ratio for predictor (2.0).
         num_projections: SIGReg random projection count (512).
         lambda_sigreg: SIGReg loss weight (0.1).
+        lambda_recon: Reconstruction loss weight (1.0).
         dropout: Dropout rate (0.0).
+        use_decoder: Whether to include the decoder (False).
+        d_dec: Decoder hidden dimension (256).
+        dec_depth: Decoder transformer depth (4).
+        dec_heads: Decoder attention heads (4).
+        dec_mlp_ratio: FFN expansion ratio for decoder (4.0).
+        dec_grid_h: Padded grid height for decoder (36).
+        dec_grid_w: Padded grid width for decoder (36).
     """
 
     def __init__(
@@ -196,11 +212,21 @@ class LeWorldModel(nn.Module):
         pred_mlp_ratio: float = 2.0,
         num_projections: int = 512,
         lambda_sigreg: float = 0.1,
+        lambda_recon: float = 1.0,
         dropout: float = 0.0,
+        use_decoder: bool = False,
+        d_dec: int = 256,
+        dec_depth: int = 4,
+        dec_heads: int = 4,
+        dec_mlp_ratio: float = 4.0,
+        dec_grid_h: int = 36,
+        dec_grid_w: int = 36,
     ):
         super().__init__()
         self.lambda_sigreg = lambda_sigreg
+        self.lambda_recon = lambda_recon
         self.d_latent = d_latent
+        self.use_decoder = use_decoder
 
         # Encoder: agent grid -> latent z (~5M params)
         self.encoder = LeWMEncoder(
@@ -228,6 +254,22 @@ class LeWorldModel(nn.Module):
         # SIGReg regularizer
         self.sigreg = SIGReg(d_latent=d_latent, num_projections=num_projections)
 
+        # Optional decoder: latent z -> agent grid
+        self.decoder: LeWMDecoder | None = None
+        if use_decoder:
+            self.decoder = LeWMDecoder(
+                d_latent=d_latent,
+                d_agent=d_agent,
+                d_dec=d_dec,
+                patch_size=patch_size,
+                grid_h=dec_grid_h,
+                grid_w=dec_grid_w,
+                depth=dec_depth,
+                heads=dec_heads,
+                mlp_ratio=dec_mlp_ratio,
+                dropout=dropout,
+            )
+
     def encode(self, state: torch.Tensor) -> torch.Tensor:
         """Encode agent grid to latent vector.
 
@@ -238,6 +280,25 @@ class LeWorldModel(nn.Module):
             z: Latent vector [B, d_latent].
         """
         return self.encoder(state)
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """Decode latent vector to agent grid.
+
+        Args:
+            z: Latent vector [B, d_latent].
+
+        Returns:
+            state: Reconstructed agent grid [B, H, W, d_agent].
+
+        Raises:
+            RuntimeError: If model was built without decoder (use_decoder=False).
+        """
+        if self.decoder is None:
+            raise RuntimeError(
+                "LeWorldModel was built without decoder. "
+                "Set use_decoder=True to enable decoding."
+            )
+        return self.decoder(z)
 
     def predict(
         self,
@@ -265,7 +326,10 @@ class LeWorldModel(nn.Module):
     ) -> LeWMLossOutput:
         """Compute full LeWM training loss.
 
-        L_total = MSE(z_pred, z_target) + lambda * SIGReg(Z)
+        Without decoder:
+            L_total = L_pred + L_reg
+        With decoder:
+            L_total = L_pred + L_reg + lambda_recon * L_recon
 
         Both states are encoded by the same encoder (end-to-end,
         no stop-gradient on the target -- following the paper).
@@ -307,13 +371,26 @@ class LeWorldModel(nn.Module):
         # Combined regularization
         loss_reg = loss_var * 25.0 + loss_cov * 1.0 + loss_sigreg * self.lambda_sigreg
 
-        # Total loss
+        # Total loss (before decoder)
         loss_total = loss_pred + loss_reg
+
+        # --- Reconstruction loss (decoder) ---
+        loss_recon: torch.Tensor | None = None
+        if self.decoder is not None:
+            # Decode both z_t and z_t1, compare to original states in raw space
+            state_t_recon = self.decoder(z_t)    # [B, H, W, d_agent]
+            state_t1_recon = self.decoder(z_t1)  # [B, H, W, d_agent]
+            loss_recon = 0.5 * (
+                F.mse_loss(state_t_recon, state_t)
+                + F.mse_loss(state_t1_recon, state_t1)
+            )
+            loss_total = loss_total + self.lambda_recon * loss_recon
 
         return LeWMLossOutput(
             loss_total=loss_total,
             loss_pred=loss_pred,
             loss_sigreg=loss_reg,  # report combined reg loss
+            loss_recon=loss_recon,
             z_t=z_t,
             z_t1_target=z_t1,
             z_t1_pred=z_t1_pred,
@@ -345,16 +422,23 @@ def build_lewm(cfg) -> LeWorldModel:
             d_enc, d_latent, d_pred, d_cond,
             enc_depth, enc_heads, pred_depth, pred_heads,
             enc_mlp_ratio, pred_mlp_ratio,
-            num_projections, lambda_sigreg, dropout
+            num_projections, lambda_sigreg, lambda_recon,
+            dropout, use_decoder,
+            d_dec, dec_depth, dec_heads, dec_mlp_ratio
     """
     lc = cfg.lewm
+    p = cfg.patch.patch_size
+    # Compute padded grid dims (round up to nearest multiple of patch_size)
+    pad_h = ((cfg.patch.grid_h + p - 1) // p) * p
+    pad_w = ((cfg.patch.grid_w + p - 1) // p) * p
+
     return LeWorldModel(
         d_agent=cfg.agent.raw_dim,
         d_enc=lc.d_enc,
         d_latent=lc.d_latent,
         d_pred=lc.d_pred,
         d_cond=lc.get("d_cond", 32),
-        patch_size=cfg.patch.patch_size,
+        patch_size=p,
         enc_depth=lc.enc_depth,
         enc_heads=lc.enc_heads,
         pred_depth=lc.pred_depth,
@@ -363,5 +447,13 @@ def build_lewm(cfg) -> LeWorldModel:
         pred_mlp_ratio=lc.get("pred_mlp_ratio", 2.0),
         num_projections=lc.get("num_projections", 512),
         lambda_sigreg=lc.get("lambda_sigreg", 0.1),
+        lambda_recon=lc.get("lambda_recon", 1.0),
         dropout=lc.get("dropout", 0.0),
+        use_decoder=lc.get("use_decoder", False),
+        d_dec=lc.get("d_dec", 256),
+        dec_depth=lc.get("dec_depth", 4),
+        dec_heads=lc.get("dec_heads", 4),
+        dec_mlp_ratio=lc.get("dec_mlp_ratio", 4.0),
+        dec_grid_h=pad_h,
+        dec_grid_w=pad_w,
     )

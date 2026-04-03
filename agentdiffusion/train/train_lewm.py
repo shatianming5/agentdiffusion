@@ -59,6 +59,9 @@ class LeWMTrainer:
         print(f"LeWorldModel parameters:")
         print(f"  Encoder:   {enc_params / 1e6:.2f}M")
         print(f"  Predictor: {pred_params / 1e6:.2f}M")
+        if self.model.decoder is not None:
+            dec_params = sum(p.numel() for p in self.model.decoder.parameters())
+            print(f"  Decoder:   {dec_params / 1e6:.2f}M")
         print(f"  Total:     {total / 1e6:.2f}M")
 
     def _warmup_lr(self):
@@ -144,13 +147,16 @@ class LeWMTrainer:
                             loss_out.z_t1_pred, loss_out.z_t1_target, dim=-1,
                         ).mean().item()
 
-                    pbar.set_postfix(
+                    postfix = dict(
                         loss=f"{loss_out.loss_total.item():.4f}",
                         pred=f"{z_pred_mse:.4f}",
                         sigreg=f"{loss_out.loss_sigreg.item():.4f}",
                         z_std=f"{z_std:.3f}",
                         cos=f"{cosine_sim:.3f}",
                     )
+                    if loss_out.loss_recon is not None:
+                        postfix["recon"] = f"{loss_out.loss_recon.item():.4f}"
+                    pbar.set_postfix(**postfix)
 
                 # Checkpoint
                 if self.global_step % self.cfg.train.save_every == 0:

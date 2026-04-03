@@ -8,7 +8,7 @@ patch:
   grid_h: 34
   grid_w: 33
 
-# LeWorldModel architecture (~15M params total)
+# LeWorldModel architecture (~15M params encoder+predictor, ~18M with decoder)
 lewm:
   # Encoder (ViT-tiny, ~5.6M params)
   d_enc: 256
@@ -24,9 +24,19 @@ lewm:
   pred_heads: 8
   pred_mlp_ratio: 2.0
 
+  # Decoder (Transformer, ~3M params) — maps latent back to raw agent grid
+  use_decoder: false        # set true to enable decoder + reconstruction loss
+  d_dec: 256
+  dec_depth: 4
+  dec_heads: 4
+  dec_mlp_ratio: 4.0
+
   # General
   dropout: 0.0
 
   # SIGReg regularization
   num_projections: 512
   lambda_sigreg: 5.0
+
+  # Reconstruction loss weight (only active when use_decoder=true)
+  lambda_recon: 1.0
