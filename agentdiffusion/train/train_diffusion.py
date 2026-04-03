@@ -97,8 +97,13 @@ class DiffusionTrainer:
         print(f"Loaded AE from {path}")
 
     def build_dataloader(self) -> DataLoader:
+        # Compute pad target: round grid up to nearest multiple of patch_size
+        p = self.cfg.patch.patch_size
+        pad_h = ((self.cfg.patch.grid_h + p - 1) // p) * p
+        pad_w = ((self.cfg.patch.grid_w + p - 1) // p) * p
+        print(f"Grid {self.cfg.patch.grid_h}x{self.cfg.patch.grid_w} -> padded to {pad_h}x{pad_w} (patch_size={p})")
         try:
-            dataset = AgentTransitionDataset(self.cfg.data.data_dir)
+            dataset = AgentTransitionDataset(self.cfg.data.data_dir, pad_to=(pad_h, pad_w))
         except FileNotFoundError:
             print("No data files found, using synthetic data for testing")
             dataset = SyntheticAgentDataset(

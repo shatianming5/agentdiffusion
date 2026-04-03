@@ -9,6 +9,19 @@ import torch
 from torch.utils.data import Dataset
 
 
+def _pad_grid(tensor: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+    """Pad [H, W, ...] tensor to [target_h, target_w, ...] with zeros."""
+    h, w = tensor.shape[:2]
+    if h >= target_h and w >= target_w:
+        return tensor[:target_h, :target_w]
+    pad_h, pad_w = target_h - h, target_w - w
+    if tensor.ndim == 3:
+        return torch.nn.functional.pad(tensor, (0, 0, 0, max(0, pad_w), 0, max(0, pad_h)))
+    elif tensor.ndim == 2:
+        return torch.nn.functional.pad(tensor, (0, max(0, pad_w), 0, max(0, pad_h)), value=-1)
+    return tensor
+
+
 class AgentTransitionDataset(Dataset):
     """Dataset of (state_t, state_t1, market_cond) tuples.
 
@@ -17,20 +30,30 @@ class AgentTransitionDataset(Dataset):
         state_t1:    [H, W, C]
         market_cond: [market_cond_dim]
         agent_types: [H, W]
+
+    If pad_to is set, grids are padded to (pad_h, pad_w) so they are
+    divisible by the patch size used in the diffusion model.
     """
 
-    def __init__(self, data_dir: str, transform=None):
+    def __init__(self, data_dir: str, transform=None, pad_to: tuple[int, int] | None = None):
         self.data_dir = Path(data_dir)
         self.files = sorted(self.data_dir.glob("*.pt"))
         if not self.files:
             raise FileNotFoundError(f"No .pt files found in {data_dir}")
         self.transform = transform
+        self.pad_to = pad_to
 
     def __len__(self) -> int:
         return len(self.files)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         data = torch.load(self.files[idx], map_location="cpu", weights_only=True)
+        if self.pad_to is not None:
+            th, tw = self.pad_to
+            data["state_t"] = _pad_grid(data["state_t"], th, tw)
+            data["state_t1"] = _pad_grid(data["state_t1"], th, tw)
+            if "agent_types" in data:
+                data["agent_types"] = _pad_grid(data["agent_types"], th, tw)
         if self.transform:
             data = self.transform(data)
         return data
