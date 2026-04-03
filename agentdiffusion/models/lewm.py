@@ -28,6 +28,12 @@ from .lewm_predictor import LeWMPredictor
 from .lewm_decoder import LeWMDecoder
 
 
+def masked_mean(tensor: torch.Tensor, mask: torch.Tensor, dims: tuple[int, ...]) -> torch.Tensor:
+    """Average tensor over dims, only counting positions where mask is True."""
+    tensor = tensor * mask.float()
+    return tensor.sum(dim=dims) / mask.float().sum(dim=dims).clamp(min=1)
+
+
 @dataclass
 class LeWMLossOutput:
     """Container for LeWorldModel loss components."""
@@ -35,6 +41,8 @@ class LeWMLossOutput:
     loss_pred: torch.Tensor
     loss_sigreg: torch.Tensor
     loss_recon: torch.Tensor | None
+    loss_price: torch.Tensor | None
+    loss_returns: torch.Tensor | None
     z_t: torch.Tensor
     z_t1_target: torch.Tensor
     z_t1_pred: torch.Tensor
@@ -186,6 +194,8 @@ class LeWorldModel(nn.Module):
         num_projections: SIGReg random projection count (512).
         lambda_sigreg: SIGReg loss weight (0.1).
         lambda_recon: Reconstruction loss weight (1.0).
+        lambda_price: Price prediction MSE loss weight (10.0).
+        lambda_returns: Log-return Huber loss weight (5.0).
         dropout: Dropout rate (0.0).
         use_decoder: Whether to include the decoder (False).
         d_dec: Decoder hidden dimension (256).
@@ -213,6 +223,8 @@ class LeWorldModel(nn.Module):
         num_projections: int = 512,
         lambda_sigreg: float = 0.1,
         lambda_recon: float = 1.0,
+        lambda_price: float = 10.0,
+        lambda_returns: float = 5.0,
         dropout: float = 0.0,
         use_decoder: bool = False,
         d_dec: int = 256,
@@ -225,6 +237,8 @@ class LeWorldModel(nn.Module):
         super().__init__()
         self.lambda_sigreg = lambda_sigreg
         self.lambda_recon = lambda_recon
+        self.lambda_price = lambda_price
+        self.lambda_returns = lambda_returns
         self.d_latent = d_latent
         self.use_decoder = use_decoder
 
@@ -253,6 +267,13 @@ class LeWorldModel(nn.Module):
 
         # SIGReg regularizer
         self.sigreg = SIGReg(d_latent=d_latent, num_projections=num_projections)
+
+        # Price prediction head: latent -> scalar price
+        self.price_head = nn.Sequential(
+            nn.Linear(d_latent, d_latent // 2),
+            nn.GELU(),
+            nn.Linear(d_latent // 2, 1),
+        )
 
         # Optional decoder: latent z -> agent grid
         self.decoder: LeWMDecoder | None = None
@@ -368,10 +389,11 @@ class LeWorldModel(nn.Module):
         # 3) SIGReg (original)
         loss_sigreg = self.sigreg(z_all)
 
-        # Combined regularization
-        loss_reg = loss_var * 25.0 + loss_cov * 1.0 + loss_sigreg * self.lambda_sigreg
+        # Combined regularization (reduced from original 25/1/5 to prevent
+        # over-regularization that dilutes prediction signal)
+        loss_reg = loss_var * 2.0 + loss_cov * 0.1 + loss_sigreg * self.lambda_sigreg
 
-        # Total loss (before decoder)
+        # Total loss (before decoder, price, returns)
         loss_total = loss_pred + loss_reg
 
         # --- Reconstruction loss (decoder) ---
@@ -386,11 +408,35 @@ class LeWorldModel(nn.Module):
             )
             loss_total = loss_total + self.lambda_recon * loss_recon
 
+        # --- Price prediction loss ---
+        # Directly supervise price dynamics from latent space.
+        # Extract ground truth prices from raw states (dim 98 = normalized mid price).
+        # Use mask to exclude padding agents (padding has all-zero features).
+        mask_hw = (state_t[..., 0] != 0) | (state_t[..., 1] != 0)  # [B, H, W]
+        price_t_gt = masked_mean(state_t[..., 98], mask_hw, dims=(1, 2))    # [B]
+        price_t1_gt = masked_mean(state_t1[..., 98], mask_hw, dims=(1, 2))  # [B]
+
+        price_t1_pred = self.price_head(z_t1_pred).squeeze(-1)  # [B]
+        loss_price = F.mse_loss(price_t1_pred, price_t1_gt)
+
+        # Returns prediction loss (log-return)
+        ret_gt = (torch.log(price_t1_gt.clamp(min=0.01))
+                  - torch.log(price_t_gt.clamp(min=0.01)))
+        ret_pred = (torch.log(price_t1_pred.clamp(min=0.01))
+                    - torch.log(self.price_head(z_t).squeeze(-1).clamp(min=0.01)))
+        loss_returns = F.huber_loss(ret_pred, ret_gt)
+
+        loss_total = (loss_total
+                      + self.lambda_price * loss_price
+                      + self.lambda_returns * loss_returns)
+
         return LeWMLossOutput(
             loss_total=loss_total,
             loss_pred=loss_pred,
             loss_sigreg=loss_reg,  # report combined reg loss
             loss_recon=loss_recon,
+            loss_price=loss_price,
+            loss_returns=loss_returns,
             z_t=z_t,
             z_t1_target=z_t1,
             z_t1_pred=z_t1_pred,
@@ -448,6 +494,8 @@ def build_lewm(cfg) -> LeWorldModel:
         num_projections=lc.get("num_projections", 512),
         lambda_sigreg=lc.get("lambda_sigreg", 0.1),
         lambda_recon=lc.get("lambda_recon", 1.0),
+        lambda_price=lc.get("lambda_price", 10.0),
+        lambda_returns=lc.get("lambda_returns", 5.0),
         dropout=lc.get("dropout", 0.0),
         use_decoder=lc.get("use_decoder", False),
         d_dec=lc.get("d_dec", 256),

@@ -99,6 +99,96 @@ class AgentFlatDataset(Dataset):
         return agents[agent_idx]  # [C]
 
 
+class AgentSequenceDataset(Dataset):
+    """Dataset that returns sequences of K consecutive transitions from same simulation.
+
+    Groups .pt files by sim_id, sorts within each group by time_index,
+    then yields sliding windows of seq_len consecutive (state, market_cond) pairs.
+
+    Each __getitem__ returns a dict:
+        seq_states:    [K+1, H, W, C]  — K+1 states covering K transitions
+        seq_conds:     [K, cond_dim]   — market conditions for each transition
+        seq_agent_types: [H, W]        — agent types (from first timestep)
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        seq_len: int = 4,
+        pad_to: tuple[int, int] | None = None,
+    ):
+        self.data_dir = Path(data_dir)
+        self.seq_len = seq_len
+        self.pad_to = pad_to
+
+        all_files = sorted(self.data_dir.glob("*.pt"))
+        if not all_files:
+            raise FileNotFoundError(f"No .pt files found in {data_dir}")
+
+        # Group files by sim_id, sort by time_index within each group
+        sim_groups: dict[int, list[tuple[int, Path]]] = {}
+        for f in all_files:
+            data = torch.load(f, map_location="cpu", weights_only=True)
+            sid = int(data.get("sim_id", 0))
+            tidx = int(data.get("time_index", 0))
+            sim_groups.setdefault(sid, []).append((tidx, f))
+
+        # Sort each group by time_index and build sliding windows
+        self.windows: list[list[Path]] = []
+        for sid in sorted(sim_groups.keys()):
+            group = sorted(sim_groups[sid], key=lambda x: x[0])
+            paths = [p for _, p in group]
+            # Each transition file already contains (state_t, state_t1).
+            # A window of seq_len transitions needs seq_len consecutive files.
+            if len(paths) >= seq_len:
+                for start in range(len(paths) - seq_len + 1):
+                    self.windows.append(paths[start : start + seq_len])
+
+        if not self.windows:
+            raise ValueError(
+                f"No sequences of length {seq_len} found. "
+                f"Have {len(all_files)} files across {len(sim_groups)} sims."
+            )
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        window = self.windows[idx]
+        states: list[torch.Tensor] = []
+        conds: list[torch.Tensor] = []
+        agent_types = None
+
+        for i, fpath in enumerate(window):
+            data = torch.load(fpath, map_location="cpu", weights_only=True)
+            st = data["state_t"]
+            st1 = data["state_t1"]
+            mc = data["market_cond"]
+
+            if self.pad_to is not None:
+                th, tw = self.pad_to
+                st = _pad_grid(st, th, tw)
+                st1 = _pad_grid(st1, th, tw)
+
+            if i == 0:
+                states.append(st)
+                if "agent_types" in data:
+                    at = data["agent_types"]
+                    if self.pad_to is not None:
+                        at = _pad_grid(at, self.pad_to[0], self.pad_to[1])
+                    agent_types = at
+            states.append(st1)
+            conds.append(mc)
+
+        result: dict[str, torch.Tensor] = {
+            "seq_states": torch.stack(states),   # [K+1, H, W, C]
+            "seq_conds": torch.stack(conds),     # [K, cond_dim]
+        }
+        if agent_types is not None:
+            result["seq_agent_types"] = agent_types
+        return result
+
+
 class SyntheticAgentDataset(Dataset):
     """Generates synthetic agent data for testing (no ABIDES dependency).
 

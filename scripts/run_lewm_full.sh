@@ -39,7 +39,8 @@ echo "=== Phase 2: Train LeWorldModel with Decoder (50K steps) ==="
     lewm.enc_depth=6 lewm.enc_heads=8 \
     lewm.pred_depth=6 lewm.pred_heads=8 \
     lewm.enc_mlp_ratio=4.0 lewm.pred_mlp_ratio=2.0 \
-    lewm.num_projections=512 lewm.lambda_sigreg=5.0 \
+    lewm.num_projections=512 lewm.lambda_sigreg=0.5 \
+    lewm.lambda_price=10.0 lewm.lambda_returns=5.0 \
     lewm.use_decoder=true \
     lewm.d_dec=256 lewm.dec_depth=4 lewm.dec_heads=4 lewm.dec_mlp_ratio=4.0 \
     lewm.lambda_recon=1.0 \
@@ -61,7 +62,7 @@ from pathlib import Path
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
 
-from agentdiffusion.models.lewm import LeWorldModel
+from agentdiffusion.models.lewm import LeWorldModel, masked_mean
 from agentdiffusion.data.dataset import _pad_grid
 from agentdiffusion.constraints.projection import apply_all_projections
 from agentdiffusion.eval.stylized_facts import evaluate_stylized_facts
@@ -79,7 +80,8 @@ model = LeWorldModel(
     d_agent=D_AGENT, d_enc=256, d_latent=256, d_pred=384, d_cond=32,
     patch_size=4, enc_depth=6, enc_heads=8, pred_depth=6, pred_heads=8,
     enc_mlp_ratio=4.0, pred_mlp_ratio=2.0,
-    num_projections=512, lambda_sigreg=0.1, lambda_recon=1.0,
+    num_projections=512, lambda_sigreg=0.5, lambda_recon=1.0,
+    lambda_price=10.0, lambda_returns=5.0,
     use_decoder=True, d_dec=256, dec_depth=4, dec_heads=4, dec_mlp_ratio=4.0,
     dec_grid_h=PAD_H, dec_grid_w=PAD_W,
 ).to(device)
@@ -215,8 +217,20 @@ print("(d) Price Series Extraction")
 print("="*60)
 
 # Mid price is at dim 98 (observation slice 96:112, offset 2 = mid price)
-# Average across all agents to get market-level price
-prices = state_traj_np[:, :, :, MID_PRICE_DIM].mean(axis=(1, 2))  # [201]
+# Use masked mean to exclude padding agents (padding has all-zero features)
+# Load agent_types from a sample to build the validity mask
+_sample_at = sample.get("agent_types", None)
+if _sample_at is not None:
+    _at_padded = _pad_grid(_sample_at.cpu(), PAD_H, PAD_W)
+    valid_mask = (_at_padded != -1).numpy()  # [H, W]
+else:
+    # Fallback: non-padding = any non-zero feature in dims 0 or 1
+    valid_mask = (state_traj_np[0, :, :, 0] != 0) | (state_traj_np[0, :, :, 1] != 0)
+
+price_raw = state_traj_np[:, :, :, MID_PRICE_DIM]  # [201, H, W]
+valid_f = valid_mask.astype(np.float32)[None, :, :]  # [1, H, W]
+valid_sum = valid_f.sum()
+prices = (price_raw * valid_f).sum(axis=(1, 2)) / max(valid_sum, 1.0)  # [201]
 print(f"  Price series length:   {len(prices)}")
 print(f"  Price range:           [{prices.min():.4f}, {prices.max():.4f}]")
 print(f"  Price mean:            {prices.mean():.4f}")

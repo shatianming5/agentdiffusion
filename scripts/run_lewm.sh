@@ -39,7 +39,8 @@ echo "=== Phase 2: Train LeWorldModel (50K steps) ==="
     lewm.enc_depth=6 lewm.enc_heads=8 \
     lewm.pred_depth=6 lewm.pred_heads=8 \
     lewm.enc_mlp_ratio=4.0 lewm.pred_mlp_ratio=2.0 \
-    lewm.num_projections=512 lewm.lambda_sigreg=5.0 \
+    lewm.num_projections=512 lewm.lambda_sigreg=0.5 \
+    lewm.lambda_price=10.0 lewm.lambda_returns=5.0 \
     train.total_steps=50000 train.batch_size=16 \
     train.lr=3e-4 train.weight_decay=0.05 \
     train.warmup_steps=2000 \

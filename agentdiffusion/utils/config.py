@@ -66,6 +66,8 @@ class TrainConfig:
     log_every: int = 100
     save_every: int = 10_000
     eval_every: int = 5_000
+    rollout_steps: int = 1   # 1 = single-step (backward compat), >1 = multi-step rollout
+    seq_len: int = 8         # sequence length for AgentSequenceDataset
 
 
 @dataclass
@@ -90,9 +92,12 @@ class LeWMConfig:
     pred_mlp_ratio: float = 2.0
     dropout: float = 0.0
     num_projections: int = 512
-    lambda_sigreg: float = 5.0
+    lambda_sigreg: float = 0.5
+    # Price / returns supervision
+    lambda_price: float = 10.0
+    lambda_returns: float = 5.0
     # Decoder
-    use_decoder: bool = False
+    use_decoder: bool = True
     d_dec: int = 256
     dec_depth: int = 4
     dec_heads: int = 4

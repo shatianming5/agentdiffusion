@@ -103,7 +103,11 @@ def _extract_agent_state(agent, L1_prices: dict, step_idx: int, total_steps: int
 
 
 def _get_l1_prices(L1: dict, snapshot_idx: int) -> dict:
-    """Extract price info from a specific L1 snapshot index."""
+    """Extract price info from a specific L1 snapshot index.
+
+    Also computes richer derived features: log return, realized volatility,
+    spread in basis points, and momentum from recent price history.
+    """
     prices = {}
     bids = L1.get("best_bids", [])
     asks = L1.get("best_asks", [])
@@ -118,6 +122,48 @@ def _get_l1_prices(L1: dict, snapshot_idx: int) -> dict:
     prices["mid"] = (bid + ask) / 2
     prices["spread"] = ask - bid
     prices["last_trade"] = prices["mid"]
+
+    # --- Derived features for richer market_cond ---
+    mid = prices["mid"]
+    n_l1 = len(bids)
+
+    # Spread in basis points
+    prices["spread_bps"] = (ask - bid) / mid * 10000.0 if mid > 0 else 0.0
+
+    # Log return from previous snapshot (if available)
+    if snapshot_idx > 0:
+        prev_bid = bids[snapshot_idx - 1][1] if bids[snapshot_idx - 1][1] is not None else 100000
+        prev_ask = asks[snapshot_idx - 1][1] if asks[snapshot_idx - 1][1] is not None else 100000
+        prev_mid = (prev_bid + prev_ask) / 2
+        if prev_mid > 0 and mid > 0:
+            prices["log_return"] = float(np.log(mid / prev_mid))
+        else:
+            prices["log_return"] = 0.0
+    else:
+        prices["log_return"] = 0.0
+
+    # Realized volatility: std of recent log returns (lookback window up to 20)
+    lookback = min(20, snapshot_idx)
+    if lookback >= 2:
+        recent_mids = []
+        for j in range(snapshot_idx - lookback, snapshot_idx + 1):
+            b = bids[j][1] if j < len(bids) and bids[j][1] is not None else 100000
+            a = asks[j][1] if j < len(asks) and asks[j][1] is not None else 100000
+            recent_mids.append((b + a) / 2)
+        recent_mids = np.array(recent_mids, dtype=np.float64).clip(min=1)
+        log_rets = np.diff(np.log(recent_mids))
+        prices["realized_vol"] = float(log_rets.std()) if len(log_rets) > 0 else 0.0
+        # Momentum: sign of cumulative return over lookback
+        cum_ret = float(np.log(recent_mids[-1] / recent_mids[0])) if recent_mids[0] > 0 else 0.0
+        prices["momentum"] = float(np.sign(cum_ret))
+        prices["cum_return"] = float(cum_ret)
+    else:
+        prices["realized_vol"] = 0.0
+        prices["momentum"] = 0.0
+        prices["cum_return"] = 0.0
+
+    # Time of day (fraction of total snapshots)
+    prices["time_frac"] = snapshot_idx / max(n_l1 - 1, 1) if n_l1 > 1 else 0.0
 
     return prices
 
@@ -212,13 +258,33 @@ def generate_abides_dataset(
             grid_t, grid_types, sort_idx = grid.arrange(states_t_tensor, types, capitals)
             grid_t1, _, _ = grid.arrange(states_t1_tensor, types, capitals)
 
-            # Market condition vector [32]
+            # Market condition vector [32] — enriched with derivatives
             market_cond = torch.zeros(32)
+            # Core prices (dims 0-4)
             market_cond[0] = l1_prices_t.get("mid", 100000) / 100000.0
             market_cond[1] = l1_prices_t.get("spread", 0) / 100000.0
             market_cond[2] = l1_prices_t.get("bid", 100000) / 100000.0
             market_cond[3] = l1_prices_t.get("ask", 100000) / 100000.0
             market_cond[4] = float(t_idx) / max(n_l1, 1)  # time progress
+            # Log return (dim 5)
+            market_cond[5] = np.clip(l1_prices_t.get("log_return", 0.0), -0.1, 0.1)
+            # Realized volatility (dim 6)
+            market_cond[6] = np.clip(l1_prices_t.get("realized_vol", 0.0), 0.0, 0.1)
+            # Spread in basis points (dim 7)
+            market_cond[7] = np.clip(l1_prices_t.get("spread_bps", 0.0) / 100.0, 0.0, 5.0)
+            # Momentum sign (dim 8)
+            market_cond[8] = l1_prices_t.get("momentum", 0.0)
+            # Cumulative return (dim 9)
+            market_cond[9] = np.clip(l1_prices_t.get("cum_return", 0.0), -0.5, 0.5)
+            # Time of day as fraction (dim 10)
+            market_cond[10] = l1_prices_t.get("time_frac", 0.0)
+            # Next-step prices for supervision signal (dims 11-14)
+            market_cond[11] = l1_prices_t1.get("mid", 100000) / 100000.0
+            market_cond[12] = l1_prices_t1.get("spread", 0) / 100000.0
+            market_cond[13] = np.clip(l1_prices_t1.get("log_return", 0.0), -0.1, 0.1)
+            market_cond[14] = np.clip(l1_prices_t1.get("realized_vol", 0.0), 0.0, 0.1)
+            # Price deviation from par (dim 15)
+            market_cond[15] = (l1_prices_t.get("mid", 100000) - 100000) / 100000.0
 
             # Save
             torch.save({

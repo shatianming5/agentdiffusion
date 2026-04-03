@@ -10,6 +10,8 @@ train:
   log_every: 100
   save_every: 10000
   eval_every: 5000
+  rollout_steps: 4     # multi-step unrolled training (1 = backward compat single-step)
+  seq_len: 8           # consecutive transitions per sequence window
 
 data:
   data_dir: data/abides_norm

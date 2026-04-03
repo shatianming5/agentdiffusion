@@ -25,7 +25,7 @@ lewm:
   pred_mlp_ratio: 2.0
 
   # Decoder (Transformer, ~3M params) — maps latent back to raw agent grid
-  use_decoder: false        # set true to enable decoder + reconstruction loss
+  use_decoder: true         # enable decoder + reconstruction loss
   d_dec: 256
   dec_depth: 4
   dec_heads: 4
@@ -34,9 +34,13 @@ lewm:
   # General
   dropout: 0.0
 
-  # SIGReg regularization
+  # SIGReg regularization (reduced from 5.0 to prevent over-regularization)
   num_projections: 512
-  lambda_sigreg: 5.0
+  lambda_sigreg: 0.5
 
   # Reconstruction loss weight (only active when use_decoder=true)
   lambda_recon: 1.0
+
+  # Price / returns supervision
+  lambda_price: 10.0
+  lambda_returns: 5.0
