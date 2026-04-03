@@ -29,4 +29,4 @@ lewm:
 
   # SIGReg regularization
   num_projections: 512
-  lambda_sigreg: 0.1
+  lambda_sigreg: 5.0
