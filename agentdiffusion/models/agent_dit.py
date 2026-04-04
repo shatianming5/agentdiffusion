@@ -9,6 +9,7 @@ from .autoencoder import AgentEncoder, AgentDecoder
 from .patchify import PatchEmbedding, Unpatchify
 from .embeddings import ConditionEmbedding
 from .dit_block import DiTBlock, FinalLayer
+from .stochastic_vol import StochasticVolatilityHead, StochasticVolatilityOutput
 
 
 class AgentDiT(nn.Module):
@@ -83,6 +84,13 @@ class AgentDiT(nn.Module):
             nn.Linear(64, 1),
         )
 
+        # --- Stochastic volatility head (optional, for return generation) ---
+        # After DDIM produces a denoised latent grid, the caller can pool it to
+        # a [B, d_vol_latent] vector and feed it to vol_head for heavy-tailed
+        # return sampling.  d_vol_latent equals d_model so that global-average-
+        # pooled patch tokens can be used directly.
+        self.vol_head = StochasticVolatilityHead(d_latent=d_model)
+
         self._init_weights()
 
     def _init_weights(self):
@@ -146,6 +154,40 @@ class AgentDiT(nn.Module):
         if return_price:
             return x, price_pred
         return x
+
+
+    def forward_vol(
+        self,
+        z_denoised: torch.Tensor,
+        prev_return: torch.Tensor,
+        prev_sigma: torch.Tensor,
+        h_vol: torch.Tensor | None = None,
+    ) -> StochasticVolatilityOutput:
+        """Run stochastic volatility head on a denoised latent grid.
+
+        After DDIM produces z_denoised [B, H, W, latent_dim], this method
+        pools it to [B, d_model] and passes it through the vol_head.
+
+        Args:
+            z_denoised: Denoised latent grid [B, H, W, latent_dim].
+            prev_return: Previous return [B].
+            prev_sigma: Previous volatility [B].
+            h_vol: Optional volatility hidden state.
+
+        Returns:
+            StochasticVolatilityOutput with distribution parameters.
+        """
+        B = z_denoised.shape[0]
+        # Patchify to get hidden representations, then global average pool
+        x = self.patch_embed(z_denoised)  # [B, N_patches, d_model]
+        # Use only patch embedding (no full DiT blocks) for efficiency
+        pooled = x.mean(dim=1)  # [B, d_model]
+        return self.vol_head(
+            z_t=pooled,
+            prev_return=prev_return,
+            prev_sigma=prev_sigma,
+            h_t=h_vol,
+        )
 
 
 def build_agent_dit(cfg) -> AgentDiT:

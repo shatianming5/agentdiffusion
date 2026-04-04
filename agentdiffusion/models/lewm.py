@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from .lewm_encoder import LeWMEncoder
 from .lewm_predictor import LeWMPredictor
 from .lewm_decoder import LeWMDecoder
+from .stochastic_vol import StochasticVolatilityHead, StochasticVolatilityOutput, SkewedStudentT
 from ..utils.masked import masked_mean
 
 
@@ -323,6 +324,13 @@ class LeWorldModel(nn.Module):
         nn.init.zeros_(self.latent_scale_head[0].weight)
         nn.init.constant_(self.latent_scale_head[0].bias, -3.0)  # softplus(-3) ~ 0.049
 
+        # Stochastic volatility head: sits on top of the latent state to
+        # produce heavy-tailed, skewed return distributions with multi-scale
+        # latent volatility tracking.  Created unconditionally but only used
+        # when the caller explicitly invokes generate_with_vol() or the
+        # vol-specific training path.
+        self.vol_head = StochasticVolatilityHead(d_latent=d_latent)
+
         # Optional decoder: latent z -> agent grid
         self.decoder: LeWMDecoder | None = None
         if use_decoder:
@@ -402,6 +410,49 @@ class LeWorldModel(nn.Module):
             z_mean = z_mean + z_scale * torch.randn_like(z_mean)
 
         return z_mean
+
+    def generate_with_vol(
+        self,
+        z_t: torch.Tensor,
+        market_cond: torch.Tensor,
+        r_prev: torch.Tensor,
+        sigma_prev: torch.Tensor,
+        h_vol: torch.Tensor | None = None,
+        stochastic_latent: bool = False,
+    ) -> tuple[torch.Tensor, StochasticVolatilityOutput]:
+        """Predict next latent and run it through the stochastic volatility head.
+
+        This is the primary inference entry-point for the vol-augmented model.
+
+        Pipeline::
+
+            z_{t+1} = predictor(z_t, market_cond)
+            vol_out = vol_head(z_{t+1}, r_prev, sigma_prev, h_vol)
+            # caller can then sample:
+            #   r_{t+1} ~ SkewedStudentT(vol_out.mu, vol_out.sigma,
+            #                             vol_out.nu, vol_out.skew)
+            #   p_{t+1} = p_t * exp(r_{t+1})
+
+        Args:
+            z_t: Current latent [B, d_latent].
+            market_cond: Market conditions [B, d_cond].
+            r_prev: Previous (real or generated) return [B].
+            sigma_prev: Previous volatility estimate [B].
+            h_vol: Volatility hidden state [B, num_scales * d_h] or None.
+            stochastic_latent: Whether to add learned noise to latent prediction.
+
+        Returns:
+            z_next: Predicted next latent [B, d_latent].
+            vol_out: StochasticVolatilityOutput with distribution params + h_next.
+        """
+        z_next = self.predict(z_t, market_cond, stochastic=stochastic_latent)
+        vol_out = self.vol_head(
+            z_t=z_next,
+            prev_return=r_prev,
+            prev_sigma=sigma_prev,
+            h_t=h_vol,
+        )
+        return z_next, vol_out
 
     def compute_loss(
         self,
