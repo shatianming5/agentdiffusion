@@ -14,7 +14,7 @@ echo ""
 # Phase 1: Verify crypto data exists
 # -------------------------------------------------------
 echo "=== Phase 1: Verify data ==="
-python3 -c "
+.venv/bin/python3 -c "
 from pathlib import Path
 import zipfile
 
@@ -61,7 +61,7 @@ print(f'market_cond range: [{sample[\"market_cond\"].min():.3f}, {sample[\"marke
 # -------------------------------------------------------
 echo ""
 echo "=== Phase 2: Train LeWorldModel on crypto (50K steps) ==="
-python3 -m agentdiffusion.train.train_lewm_crypto \
+.venv/bin/python3 -m agentdiffusion.train.train_lewm_crypto \
     --config configs/train/stage_lewm_crypto.yaml \
     agent.raw_dim=32 \
     patch.grid_h=8 patch.grid_w=8 \
@@ -89,7 +89,7 @@ python3 -m agentdiffusion.train.train_lewm_crypto \
 # -------------------------------------------------------
 echo ""
 echo "=== Phase 3: Full Evaluation ==="
-python3 << 'PYEOF'
+.venv/bin/python3 << 'PYEOF'
 import sys
 import numpy as np
 import torch
