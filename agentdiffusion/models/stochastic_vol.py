@@ -450,24 +450,27 @@ def leverage_moment_penalty(
     if prev_eps.shape != sigma.shape or sigma.shape != returns.shape or returns.shape != mu.shape:
         raise ValueError("prev_eps, sigma, returns, and mu must all have shape [B, T].")
 
-    # Leverage effect: negative shock at t should increase variance at t+1
-    # Shift: prev_eps[:, :-1] affects sigma[:, 1:]
-    neg_shock = F.relu(-prev_eps[:, :-1])     # [B, T-1]
-    next_sigma2 = sigma[:, 1:].pow(2)          # [B, T-1]
-    next_realized = (returns[:, 1:] - mu[:, 1:].detach()).pow(2)  # [B, T-1]
+    # Leverage effect: negative return at t should predict higher sigma at t+1
+    # We want corr(r_t, log_sigma_{t+1}) < 0
+    # Loss = relu(corr + target)  where target = -0.1 (want corr < -0.1)
+    r_prev = prev_eps[:, :-1]                  # [B, T-1] — standardized return at t
+    log_s_next = sigma[:, 1:].log()            # [B, T-1] — log sigma at t+1
 
-    # Per-sample leverage correlation: corr(neg_shock, next_sigma2)
-    # Hinge loss: we WANT sigma to increase after negative shocks
-    # Target: mean(sigma2 | neg_shock > 0) > mean(sigma2 | neg_shock == 0)
-    has_neg = neg_shock > 0
-    if has_neg.any():
-        sigma2_after_neg = (next_sigma2 * has_neg.float()).sum() / has_neg.float().sum().clamp_min(eps)
-        sigma2_after_pos = (next_sigma2 * (~has_neg).float()).sum() / (~has_neg).float().sum().clamp_min(eps)
-        # Penalize if sigma after negative shock is NOT higher
-        leverage_gap = F.relu(sigma2_after_pos - sigma2_after_neg + 1e-8)
-        return leverage_gap
-    else:
-        return prev_eps.new_zeros(())
+    # Flatten for correlation
+    r_flat = r_prev.reshape(-1)
+    s_flat = log_s_next.reshape(-1)
+
+    # Pearson correlation
+    r_mean = r_flat.mean()
+    s_mean = s_flat.mean()
+    r_std = r_flat.std().clamp_min(eps)
+    s_std = s_flat.std().clamp_min(eps)
+    corr = ((r_flat - r_mean) * (s_flat - s_mean)).mean() / (r_std * s_std)
+
+    # We want corr < -0.05 (leverage effect)
+    # Penalize: relu(corr + 0.05) — zero when corr is negative enough
+    target_corr = -0.05
+    return F.relu(corr - target_corr)
 
 
 def train_step(
