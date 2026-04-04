@@ -61,7 +61,7 @@ lewm = LeWorldModel(
     lambda_sigreg=0.5, lambda_recon=1.0, dec_grid_h=36, dec_grid_w=36,
 ).to(device)
 
-ckpt = torch.load("outputs/lewm/lewm_step_50000.pt", map_location=device, weights_only=True)
+ckpt = torch.load("outputs/lewm_full/lewm_step_50000.pt", map_location=device, weights_only=True)
 lewm.load_state_dict(ckpt["model"])
 lewm.eval()
 print(f"Loaded LeWM checkpoint (50K steps)")
