@@ -135,10 +135,11 @@ class LeWMTrainer:
     def _train_step_rollout(self, batch: dict[str, torch.Tensor]):
         """Multi-step unrolled training over K consecutive transitions.
 
-        Accumulates prediction, reconstruction, and price losses
+        Accumulates prediction, reconstruction, and return distribution losses
         at each step with temporal discounting (gamma^k).
         """
         import torch.nn.functional as F_fn
+        from torch.distributions import StudentT
 
         seq_states = batch["seq_states"].to(self.device)   # [B, K+1, H, W, C]
         seq_conds = batch["seq_conds"].to(self.device)     # [B, K, cond_dim]
@@ -153,18 +154,24 @@ class LeWMTrainer:
 
         loss_total = torch.tensor(0.0, device=self.device)
         loss_pred_acc = torch.tensor(0.0, device=self.device)
-        loss_price_acc = torch.tensor(0.0, device=self.device)
+        loss_ret_nll_acc = torch.tensor(0.0, device=self.device)
+        loss_white_acc = torch.tensor(0.0, device=self.device)
         loss_recon_acc = torch.tensor(0.0, device=self.device)
 
         z_t1_pred_last = None
         z_t1_target_last = None
+
+        # Track previous price for return computation across rollout steps
+        mask_hw_0 = (seq_states[:, 0, ..., 0] != 0) | (seq_states[:, 0, ..., 1] != 0)
+        prev_price = masked_mean(seq_states[:, 0, ..., 98], mask_hw_0, dims=(1, 2))  # [B]
 
         for k in range(rollout_k):
             cond_k = seq_conds[:, k]                    # [B, cond_dim]
             state_kp1 = seq_states[:, k + 1]            # [B, H, W, C]
             state_k = seq_states[:, k]                  # [B, H, W, C]
 
-            z_pred = self.model.predictor(z, cond_k)    # [B, d_latent]
+            # Predict with latent stochasticity during training
+            z_pred = self.model.predict(z, cond_k, stochastic=True)  # [B, d_latent]
             z_target = self.model.encode(state_kp1)     # [B, d_latent]
 
             discount = gamma ** k
@@ -179,12 +186,34 @@ class LeWMTrainer:
                 step_recon = F_fn.mse_loss(decoded, state_kp1)
                 loss_recon_acc = loss_recon_acc + discount * step_recon
 
-            # Price prediction loss with masked mean
+            # --- Return distribution loss (Student-t NLL) at each rollout step ---
             mask_hw = (state_k[..., 0] != 0) | (state_k[..., 1] != 0)  # [B, H, W]
             price_kp1_gt = masked_mean(state_kp1[..., 98], mask_hw, dims=(1, 2))  # [B]
-            price_kp1_pred = self.model.price_head(z_pred).squeeze(-1)             # [B]
-            step_price = F_fn.mse_loss(price_kp1_pred, price_kp1_gt)
-            loss_price_acc = loss_price_acc + discount * step_price
+
+            # Ground-truth log-return between consecutive steps
+            ret_gt = (torch.log(price_kp1_gt.clamp(min=0.01))
+                      - torch.log(prev_price.clamp(min=0.01)))
+
+            # Predict Student-t parameters from predicted latent
+            mu, sigma, nu = self.model.return_dist_head(z_pred)
+
+            # Asymmetric volatility (leverage effect)
+            ret_prev_cond = cond_k[:, 5]  # previous return from market_cond
+            neg_shock = F_fn.relu(-ret_prev_cond)
+            sigma = sigma * (1.0 + self.model.beta_leverage * neg_shock)
+
+            # Student-t NLL
+            dist = StudentT(df=nu, loc=mu, scale=sigma)
+            step_ret_nll = -dist.log_prob(ret_gt).mean()
+            loss_ret_nll_acc = loss_ret_nll_acc + discount * step_ret_nll
+
+            # Whiteness penalty
+            residuals = ((ret_gt - mu) / sigma).detach()
+            step_white = residuals.pow(2).mean() * 0.1
+            loss_white_acc = loss_white_acc + discount * step_white
+
+            # Update previous price for next step
+            prev_price = price_kp1_gt
 
             z_t1_pred_last = z_pred
             z_t1_target_last = z_target
@@ -195,11 +224,13 @@ class LeWMTrainer:
         # Combine accumulated losses
         w_pred = 1.0
         w_recon = self.model.lambda_recon if self.model.decoder is not None else 0.0
-        w_price = self.model.lambda_price
+        w_ret_nll = self.model.lambda_price      # repurposed
+        w_white = self.model.lambda_returns       # repurposed
 
         loss_total = (w_pred * loss_pred_acc
                       + w_recon * loss_recon_acc
-                      + w_price * loss_price_acc)
+                      + w_ret_nll * loss_ret_nll_acc
+                      + w_white * loss_white_acc)
 
         # SIGReg on final latents (do once, not per step)
         z_all = torch.cat([self.model.encode(seq_states[:, 0]), z], dim=0)
@@ -220,8 +251,9 @@ class LeWMTrainer:
             loss_pred=loss_pred_acc,
             loss_sigreg=loss_reg,
             loss_recon=loss_recon_acc if self.model.decoder is not None else None,
-            loss_price=loss_price_acc,
-            loss_returns=None,
+            loss_price=loss_ret_nll_acc,     # repurposed field
+            loss_returns=loss_white_acc,     # repurposed field
+            loss_ret_nll=loss_ret_nll_acc,
             z_t=self.model.encode(seq_states[:, 0]),
             z_t1_target=z_t1_target_last if z_t1_target_last is not None else torch.zeros(1, device=self.device),
             z_t1_pred=z_t1_pred_last if z_t1_pred_last is not None else torch.zeros(1, device=self.device),
@@ -282,10 +314,10 @@ class LeWMTrainer:
                     )
                     if loss_out.loss_recon is not None:
                         postfix["recon"] = f"{loss_out.loss_recon.item():.4f}"
-                    if loss_out.loss_price is not None:
-                        postfix["price"] = f"{loss_out.loss_price.item():.4f}"
+                    if loss_out.loss_ret_nll is not None:
+                        postfix["ret_nll"] = f"{loss_out.loss_ret_nll.item():.4f}"
                     if loss_out.loss_returns is not None:
-                        postfix["rets"] = f"{loss_out.loss_returns.item():.4f}"
+                        postfix["white"] = f"{loss_out.loss_returns.item():.4f}"
                     pbar.set_postfix(**postfix)
 
                 # Checkpoint

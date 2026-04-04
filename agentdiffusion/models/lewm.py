@@ -41,8 +41,9 @@ class LeWMLossOutput:
     loss_pred: torch.Tensor
     loss_sigreg: torch.Tensor
     loss_recon: torch.Tensor | None
-    loss_price: torch.Tensor | None
-    loss_returns: torch.Tensor | None
+    loss_price: torch.Tensor | None       # repurposed: now holds return NLL weight contribution
+    loss_returns: torch.Tensor | None     # repurposed: now holds whiteness penalty contribution
+    loss_ret_nll: torch.Tensor | None     # Student-t NLL on returns
     z_t: torch.Tensor
     z_t1_target: torch.Tensor
     z_t1_pred: torch.Tensor
@@ -166,6 +167,41 @@ class SIGReg(nn.Module):
         return loss
 
 
+class ReturnDistributionHead(nn.Module):
+    """Predicts Student-t return distribution parameters from context.
+
+    Outputs (mu, sigma, nu) for a Student-t distribution:
+      - mu: location (expected return)
+      - sigma: scale (volatility), via softplus to ensure positivity
+      - nu: degrees of freedom (> 2 for finite variance), via softplus + 2
+    """
+
+    def __init__(self, d_input: int, d_hidden: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_input, d_hidden),
+            nn.GELU(),
+            nn.Linear(d_hidden, 3),  # mu, log_sigma, log_nu
+        )
+
+    def forward(self, ctx: torch.Tensor):
+        """Predict Student-t parameters.
+
+        Args:
+            ctx: Context vector [B, d_input].
+
+        Returns:
+            mu:    [B] location parameter
+            sigma: [B] scale parameter (> 0)
+            nu:    [B] degrees of freedom (> 2)
+        """
+        out = self.net(ctx)
+        mu, log_sigma, log_nu = out.chunk(3, dim=-1)
+        sigma = F.softplus(log_sigma) + 1e-4
+        nu = 2.0 + F.softplus(log_nu)  # df > 2 for finite variance
+        return mu.squeeze(-1), sigma.squeeze(-1), nu.squeeze(-1)
+
+
 class LeWorldModel(nn.Module):
     """Full LeWorldModel: Encoder + Predictor + SIGReg + optional Decoder.
 
@@ -194,8 +230,9 @@ class LeWorldModel(nn.Module):
         num_projections: SIGReg random projection count (512).
         lambda_sigreg: SIGReg loss weight (0.1).
         lambda_recon: Reconstruction loss weight (1.0).
-        lambda_price: Price prediction MSE loss weight (10.0).
-        lambda_returns: Log-return Huber loss weight (5.0).
+        lambda_price: Return NLL loss weight (10.0, repurposed from price MSE).
+        lambda_returns: Whiteness penalty weight (5.0, repurposed from return Huber).
+        beta_leverage: Asymmetric volatility leverage effect coefficient (0.5).
         dropout: Dropout rate (0.0).
         use_decoder: Whether to include the decoder (False).
         d_dec: Decoder hidden dimension (256).
@@ -225,6 +262,7 @@ class LeWorldModel(nn.Module):
         lambda_recon: float = 1.0,
         lambda_price: float = 10.0,
         lambda_returns: float = 5.0,
+        beta_leverage: float = 0.5,
         dropout: float = 0.0,
         use_decoder: bool = False,
         d_dec: int = 256,
@@ -237,8 +275,9 @@ class LeWorldModel(nn.Module):
         super().__init__()
         self.lambda_sigreg = lambda_sigreg
         self.lambda_recon = lambda_recon
-        self.lambda_price = lambda_price
-        self.lambda_returns = lambda_returns
+        self.lambda_price = lambda_price      # repurposed: weight for return NLL
+        self.lambda_returns = lambda_returns  # repurposed: weight for whiteness penalty
+        self.beta_leverage = beta_leverage
         self.d_latent = d_latent
         self.use_decoder = use_decoder
 
@@ -268,12 +307,22 @@ class LeWorldModel(nn.Module):
         # SIGReg regularizer
         self.sigreg = SIGReg(d_latent=d_latent, num_projections=num_projections)
 
-        # Price prediction head: latent -> scalar price
-        self.price_head = nn.Sequential(
-            nn.Linear(d_latent, d_latent // 2),
-            nn.GELU(),
-            nn.Linear(d_latent // 2, 1),
+        # Return distribution head: latent -> Student-t params (mu, sigma, nu)
+        # Replaces the old deterministic price_head
+        self.return_dist_head = ReturnDistributionHead(d_input=d_latent, d_hidden=128)
+
+        # Backward-compat alias: price_head now refers to return_dist_head
+        # (kept so that external code referencing model.price_head doesn't break)
+        self.price_head = self.return_dist_head
+
+        # Latent stochasticity head: predicts per-dim scale for sampling noise
+        self.latent_scale_head = nn.Sequential(
+            nn.Linear(d_latent, d_latent),
+            nn.Softplus(),
         )
+        # Initialize to very small scale so training starts near-deterministic
+        nn.init.zeros_(self.latent_scale_head[0].weight)
+        nn.init.constant_(self.latent_scale_head[0].bias, -3.0)  # softplus(-3) ~ 0.049
 
         # Optional decoder: latent z -> agent grid
         self.decoder: LeWMDecoder | None = None
@@ -326,18 +375,34 @@ class LeWorldModel(nn.Module):
         z_t: torch.Tensor,
         market_cond: torch.Tensor,
         causal: bool = False,
+        stochastic: bool = False,
     ) -> torch.Tensor:
         """Predict next-step latent from current latent and conditions.
+
+        When stochastic=True (training), adds learned Gaussian noise to the
+        predicted mean. When stochastic=False (inference), returns the mean.
 
         Args:
             z_t: Current latent [B, d_latent] or [B, L, d_latent].
             market_cond: Market conditions [B, d_cond].
             causal: Whether to use causal masking for sequences.
+            stochastic: Whether to add latent noise (True during training).
 
         Returns:
             z_pred: Predicted next latent, same shape as z_t.
         """
-        return self.predictor(z_t, market_cond, causal=causal)
+        z_mean = self.predictor(z_t, market_cond, causal=causal)
+
+        if stochastic and self.training:
+            # Predict per-dim scale from current latent for stochastic sampling
+            z_for_scale = z_t if z_t.ndim == 2 else z_t[:, -1]  # use last step if sequence
+            z_log_scale = self.latent_scale_head(z_for_scale)
+            z_scale = z_log_scale * 0.1  # start small; softplus already applied in head
+            if z_mean.ndim == 3:
+                z_scale = z_scale.unsqueeze(1).expand_as(z_mean)
+            z_mean = z_mean + z_scale * torch.randn_like(z_mean)
+
+        return z_mean
 
     def compute_loss(
         self,
@@ -345,12 +410,13 @@ class LeWorldModel(nn.Module):
         state_t1: torch.Tensor,
         market_cond: torch.Tensor,
     ) -> LeWMLossOutput:
-        """Compute full LeWM training loss.
+        """Compute full LeWM training loss with Student-t return distribution.
 
         Without decoder:
-            L_total = L_pred + L_reg
+            L_total = L_pred + L_reg + lambda_price * L_ret_nll + lambda_returns * L_white
         With decoder:
             L_total = L_pred + L_reg + lambda_recon * L_recon
+                      + lambda_price * L_ret_nll + lambda_returns * L_white
 
         Both states are encoded by the same encoder (end-to-end,
         no stop-gradient on the target -- following the paper).
@@ -363,12 +429,14 @@ class LeWorldModel(nn.Module):
         Returns:
             LeWMLossOutput with all loss components and latent vectors.
         """
+        from torch.distributions import StudentT
+
         # Encode both states (no stop-gradient, no EMA)
         z_t = self.encoder(state_t)       # [B, d_latent]
         z_t1 = self.encoder(state_t1)     # [B, d_latent]
 
-        # Predict next latent
-        z_t1_pred = self.predictor(z_t, market_cond)  # [B, d_latent]
+        # Predict next latent (with stochastic noise during training)
+        z_t1_pred = self.predict(z_t, market_cond, stochastic=True)  # [B, d_latent]
 
         # Prediction loss: MSE in latent space
         loss_pred = F.mse_loss(z_t1_pred, z_t1)
@@ -393,7 +461,7 @@ class LeWorldModel(nn.Module):
         # over-regularization that dilutes prediction signal)
         loss_reg = loss_var * 2.0 + loss_cov * 0.1 + loss_sigreg * self.lambda_sigreg
 
-        # Total loss (before decoder, price, returns)
+        # Total loss (before decoder, returns)
         loss_total = loss_pred + loss_reg
 
         # --- Reconstruction loss (decoder) ---
@@ -408,35 +476,48 @@ class LeWorldModel(nn.Module):
             )
             loss_total = loss_total + self.lambda_recon * loss_recon
 
-        # --- Price prediction loss ---
-        # Directly supervise price dynamics from latent space.
+        # --- Student-t return distribution loss ---
         # Extract ground truth prices from raw states (dim 98 = normalized mid price).
         # Use mask to exclude padding agents (padding has all-zero features).
         mask_hw = (state_t[..., 0] != 0) | (state_t[..., 1] != 0)  # [B, H, W]
         price_t_gt = masked_mean(state_t[..., 98], mask_hw, dims=(1, 2))    # [B]
         price_t1_gt = masked_mean(state_t1[..., 98], mask_hw, dims=(1, 2))  # [B]
 
-        price_t1_pred = self.price_head(z_t1_pred).squeeze(-1)  # [B]
-        loss_price = F.mse_loss(price_t1_pred, price_t1_gt)
-
-        # Returns prediction loss (log-return)
+        # Ground-truth log-return
         ret_gt = (torch.log(price_t1_gt.clamp(min=0.01))
                   - torch.log(price_t_gt.clamp(min=0.01)))
-        ret_pred = (torch.log(price_t1_pred.clamp(min=0.01))
-                    - torch.log(self.price_head(z_t).squeeze(-1).clamp(min=0.01)))
-        loss_returns = F.huber_loss(ret_pred, ret_gt)
 
+        # Predict Student-t parameters from predicted latent
+        mu, sigma, nu = self.return_dist_head(z_t1_pred)
+
+        # Asymmetric volatility (leverage effect):
+        # sigma increases after negative returns
+        ret_prev = market_cond[:, 5]  # previous return from market_cond (dim 5 = log_return at t)
+        neg_shock = F.relu(-ret_prev)
+        # Adjust sigma with leverage term
+        sigma = sigma * (1.0 + self.beta_leverage * neg_shock)
+
+        # Student-t NLL on returns
+        dist = StudentT(df=nu, loc=mu, scale=sigma)
+        loss_ret_nll = -dist.log_prob(ret_gt).mean()
+
+        # Residual whiteness penalty (encourage no autocorrelation in residuals)
+        residuals = ((ret_gt - mu) / sigma).detach()
+        loss_white = residuals.pow(2).mean() * 0.1
+
+        # lambda_price -> weight for return NLL; lambda_returns -> weight for whiteness
         loss_total = (loss_total
-                      + self.lambda_price * loss_price
-                      + self.lambda_returns * loss_returns)
+                      + self.lambda_price * loss_ret_nll
+                      + self.lambda_returns * loss_white)
 
         return LeWMLossOutput(
             loss_total=loss_total,
             loss_pred=loss_pred,
             loss_sigreg=loss_reg,  # report combined reg loss
             loss_recon=loss_recon,
-            loss_price=loss_price,
-            loss_returns=loss_returns,
+            loss_price=loss_ret_nll,     # repurposed field
+            loss_returns=loss_white,     # repurposed field
+            loss_ret_nll=loss_ret_nll,
             z_t=z_t,
             z_t1_target=z_t1,
             z_t1_pred=z_t1_pred,
@@ -447,7 +528,7 @@ class LeWorldModel(nn.Module):
         state_t: torch.Tensor,
         market_cond: torch.Tensor,
     ) -> torch.Tensor:
-        """Inference mode: encode state and predict next latent.
+        """Inference mode: encode state and predict next latent (deterministic).
 
         Args:
             state_t: Current agent grid [B, H, W, d_agent].
@@ -457,7 +538,7 @@ class LeWorldModel(nn.Module):
             z_t1_pred: Predicted next-step latent [B, d_latent].
         """
         z_t = self.encoder(state_t)
-        return self.predictor(z_t, market_cond)
+        return self.predict(z_t, market_cond, stochastic=False)
 
 
 def build_lewm(cfg) -> LeWorldModel:
@@ -496,6 +577,7 @@ def build_lewm(cfg) -> LeWorldModel:
         lambda_recon=lc.get("lambda_recon", 1.0),
         lambda_price=lc.get("lambda_price", 10.0),
         lambda_returns=lc.get("lambda_returns", 5.0),
+        beta_leverage=lc.get("beta_leverage", 0.5),
         dropout=lc.get("dropout", 0.0),
         use_decoder=lc.get("use_decoder", False),
         d_dec=lc.get("d_dec", 256),

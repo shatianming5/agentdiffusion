@@ -81,7 +81,7 @@ model = LeWorldModel(
     patch_size=4, enc_depth=6, enc_heads=8, pred_depth=6, pred_heads=8,
     enc_mlp_ratio=4.0, pred_mlp_ratio=2.0,
     num_projections=512, lambda_sigreg=0.5, lambda_recon=1.0,
-    lambda_price=10.0, lambda_returns=5.0,
+    lambda_price=10.0, lambda_returns=5.0, beta_leverage=0.5,
     use_decoder=True, d_dec=256, dec_depth=4, dec_heads=4, dec_mlp_ratio=4.0,
     dec_grid_h=PAD_H, dec_grid_w=PAD_W,
 ).to(device)
@@ -164,21 +164,86 @@ print(f"  Projection adjustment MSE:   {delta_from_unprojected:.6f}")
 
 # ===================================================================
 # (c) 200-step rollout: latent predict -> decode -> project
+#     Uses time-varying market_cond (loaded from consecutive samples
+#     of the same sim_id, or updated from predicted prices).
 # ===================================================================
 print("\n" + "="*60)
-print("(c) 200-step Rollout (latent -> decode -> project)")
+print("(c) 200-step Rollout (latent -> decode -> project, time-varying mc)")
 print("="*60)
 
 ROLLOUT_STEPS = 200
+
+# Build a sequence of market_conds from consecutive samples of the same sim_id
+# Load all samples to find consecutive ones from the same simulation
+print("  Loading consecutive samples for time-varying market_cond...")
+all_samples = []
+for f in files:
+    s = torch.load(f, map_location="cpu", weights_only=True)
+    all_samples.append(s)
+
+# Group by sim_id, sort by time_index
+from collections import defaultdict
+sim_groups = defaultdict(list)
+for i, s in enumerate(all_samples):
+    sid = int(s.get("sim_id", 0))
+    tidx = int(s.get("time_index", 0))
+    sim_groups[sid].append((tidx, i, s))
+
+# Find the longest consecutive sequence
+mc_sequence = []
+best_sid = None
+best_len = 0
+for sid, group in sim_groups.items():
+    group.sort(key=lambda x: x[0])
+    if len(group) > best_len:
+        best_len = len(group)
+        best_sid = sid
+
+if best_sid is not None and best_len > 1:
+    group = sorted(sim_groups[best_sid], key=lambda x: x[0])
+    for _, _, s in group:
+        mc_sequence.append(s["market_cond"].unsqueeze(0).to(device))
+    print(f"  Using {len(mc_sequence)} market_conds from sim_id={best_sid}")
+else:
+    mc_sequence = [mc]
+    print(f"  Only 1 market_cond available, will update from predicted prices")
+
+# Rollout with time-varying market_cond
+MID_PRICE_DIM_MC = 0  # dim 0 of market_cond = mid_price / 100000
 
 with torch.no_grad():
     z_current = z_t.clone()
     decoded_states = [state_t]  # initial state
     z_trajectory = [z_t]
+    current_mc = mc.clone()
 
     for step in range(ROLLOUT_STEPS):
+        # Use real market_cond if available, otherwise update from predictions
+        if step < len(mc_sequence):
+            current_mc = mc_sequence[step]
+        else:
+            # Update market_cond based on predicted price from decoded state
+            prev_state = decoded_states[-1]
+            mask_hw_r = (prev_state[..., 0] != 0) | (prev_state[..., 1] != 0)
+            pred_mid = masked_mean(prev_state[..., 98], mask_hw_r, dims=(1, 2))  # [1]
+            # Update mid price (dim 0) and deviation from par (dim 15)
+            current_mc = current_mc.clone()
+            current_mc[:, 0] = pred_mid
+            current_mc[:, 15] = pred_mid - 1.0
+            # Update time fraction (dim 4, dim 10)
+            t_frac = min(1.0, (step + 1) / ROLLOUT_STEPS)
+            current_mc[:, 4] = t_frac
+            current_mc[:, 10] = t_frac
+            # Update log return (dim 5) from consecutive price changes
+            if len(decoded_states) >= 2:
+                prev2_state = decoded_states[-2]
+                mask_hw_r2 = (prev2_state[..., 0] != 0) | (prev2_state[..., 1] != 0)
+                prev2_mid = masked_mean(prev2_state[..., 98], mask_hw_r2, dims=(1, 2))
+                log_ret = torch.log(pred_mid.clamp(min=0.01)) - torch.log(prev2_mid.clamp(min=0.01))
+                current_mc[:, 5] = log_ret.clamp(-0.1, 0.1)
+
         # Predict next latent
-        z_current = model.predict(z_current, mc)
+        z_current = model.predict(z_current, current_mc)
         z_trajectory.append(z_current)
 
         # Decode to raw space

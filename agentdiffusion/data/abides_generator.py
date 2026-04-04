@@ -258,39 +258,44 @@ def generate_abides_dataset(
             grid_t, grid_types, sort_idx = grid.arrange(states_t_tensor, types, capitals)
             grid_t1, _, _ = grid.arrange(states_t1_tensor, types, capitals)
 
-            # Market condition vector [32] — enriched with derivatives
+            # Market condition vector [32] — ONLY time-t information (no future leakage)
             market_cond = torch.zeros(32)
-            # Core prices (dims 0-4)
+            # Core prices at time t (dims 0-4)
             market_cond[0] = l1_prices_t.get("mid", 100000) / 100000.0
             market_cond[1] = l1_prices_t.get("spread", 0) / 100000.0
             market_cond[2] = l1_prices_t.get("bid", 100000) / 100000.0
             market_cond[3] = l1_prices_t.get("ask", 100000) / 100000.0
             market_cond[4] = float(t_idx) / max(n_l1, 1)  # time progress
-            # Log return (dim 5)
+            # Log return at time t (dim 5) — this is r_{t-1->t}, available at t
             market_cond[5] = np.clip(l1_prices_t.get("log_return", 0.0), -0.1, 0.1)
-            # Realized volatility (dim 6)
+            # Realized volatility at time t (dim 6)
             market_cond[6] = np.clip(l1_prices_t.get("realized_vol", 0.0), 0.0, 0.1)
-            # Spread in basis points (dim 7)
+            # Spread in basis points at time t (dim 7)
             market_cond[7] = np.clip(l1_prices_t.get("spread_bps", 0.0) / 100.0, 0.0, 5.0)
-            # Momentum sign (dim 8)
+            # Momentum sign at time t (dim 8)
             market_cond[8] = l1_prices_t.get("momentum", 0.0)
-            # Cumulative return (dim 9)
+            # Cumulative return at time t (dim 9)
             market_cond[9] = np.clip(l1_prices_t.get("cum_return", 0.0), -0.5, 0.5)
-            # Time of day as fraction (dim 10)
+            # Time of day as fraction at time t (dim 10)
             market_cond[10] = l1_prices_t.get("time_frac", 0.0)
-            # Next-step prices for supervision signal (dims 11-14)
-            market_cond[11] = l1_prices_t1.get("mid", 100000) / 100000.0
-            market_cond[12] = l1_prices_t1.get("spread", 0) / 100000.0
-            market_cond[13] = np.clip(l1_prices_t1.get("log_return", 0.0), -0.1, 0.1)
-            market_cond[14] = np.clip(l1_prices_t1.get("realized_vol", 0.0), 0.0, 0.1)
-            # Price deviation from par (dim 15)
+            # Dims 11-14: RESERVED (previously held t+1 data — removed to fix future leakage)
+            # These dims are now zero and available for future time-t features.
+            # Price deviation from par at time t (dim 15)
             market_cond[15] = (l1_prices_t.get("mid", 100000) - 100000) / 100000.0
+
+            # Supervision targets (stored separately, NOT in market_cond)
+            supervision = torch.zeros(4)
+            supervision[0] = l1_prices_t1.get("mid", 100000) / 100000.0       # t+1 mid price
+            supervision[1] = l1_prices_t1.get("spread", 0) / 100000.0         # t+1 spread
+            supervision[2] = np.clip(l1_prices_t1.get("log_return", 0.0), -0.1, 0.1)  # t+1 log return
+            supervision[3] = np.clip(l1_prices_t1.get("realized_vol", 0.0), 0.0, 0.1) # t+1 realized vol
 
             # Save
             torch.save({
                 "state_t": grid_t,
                 "state_t1": grid_t1,
                 "market_cond": market_cond,
+                "supervision_targets": supervision,
                 "agent_types": grid_types,
                 "sim_id": sim,
                 "time_index": int(t_idx),

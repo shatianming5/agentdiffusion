@@ -183,7 +183,7 @@ def evaluate_stylized_facts(
     if volumes is not None:
         vv_corr, vv_pass = check_volume_volatility_correlation(volumes, returns)
     else:
-        vv_corr, vv_pass = 0.0, True  # skip if no volume data
+        vv_corr, vv_pass = 0.0, False  # auto-FAIL when no volume data provided
 
     return StylizedFactsReport(
         fat_tail_alpha=alpha,
