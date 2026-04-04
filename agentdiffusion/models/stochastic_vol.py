@@ -450,12 +450,24 @@ def leverage_moment_penalty(
     if prev_eps.shape != sigma.shape or sigma.shape != returns.shape or returns.shape != mu.shape:
         raise ValueError("prev_eps, sigma, returns, and mu must all have shape [B, T].")
 
-    neg_shock = F.relu(-prev_eps)
-    weights = neg_shock / neg_shock.sum().clamp_min(eps)
-    pred_moment = (weights * sigma.pow(2)).sum()
-    realized_var = (returns - mu.detach()).pow(2)
-    target_moment = (weights * realized_var).sum()
-    return F.mse_loss(pred_moment, target_moment)
+    # Leverage effect: negative shock at t should increase variance at t+1
+    # Shift: prev_eps[:, :-1] affects sigma[:, 1:]
+    neg_shock = F.relu(-prev_eps[:, :-1])     # [B, T-1]
+    next_sigma2 = sigma[:, 1:].pow(2)          # [B, T-1]
+    next_realized = (returns[:, 1:] - mu[:, 1:].detach()).pow(2)  # [B, T-1]
+
+    # Per-sample leverage correlation: corr(neg_shock, next_sigma2)
+    # Hinge loss: we WANT sigma to increase after negative shocks
+    # Target: mean(sigma2 | neg_shock > 0) > mean(sigma2 | neg_shock == 0)
+    has_neg = neg_shock > 0
+    if has_neg.any():
+        sigma2_after_neg = (next_sigma2 * has_neg.float()).sum() / has_neg.float().sum().clamp_min(eps)
+        sigma2_after_pos = (next_sigma2 * (~has_neg).float()).sum() / (~has_neg).float().sum().clamp_min(eps)
+        # Penalize if sigma after negative shock is NOT higher
+        leverage_gap = F.relu(sigma2_after_pos - sigma2_after_neg + 1e-8)
+        return leverage_gap
+    else:
+        return prev_eps.new_zeros(())
 
 
 def train_step(
