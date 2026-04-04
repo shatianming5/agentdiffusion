@@ -42,6 +42,6 @@ lewm:
   lambda_recon: 1.0
 
   # Return distribution supervision (Student-t NLL + whiteness penalty)
-  lambda_price: 10.0       # weight for Student-t return NLL
-  lambda_returns: 5.0      # weight for residual whiteness penalty
+  lambda_price: 1.0        # weight for Student-t return NLL (clamped [-10,10])
+  lambda_returns: 1.0      # weight for residual whiteness penalty
   beta_leverage: 0.5       # asymmetric volatility leverage effect coefficient

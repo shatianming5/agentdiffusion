@@ -94,8 +94,8 @@ class LeWMConfig:
     num_projections: int = 512
     lambda_sigreg: float = 0.5
     # Price / returns supervision
-    lambda_price: float = 10.0
-    lambda_returns: float = 5.0
+    lambda_price: float = 1.0
+    lambda_returns: float = 1.0
     # Decoder
     use_decoder: bool = True
     d_dec: int = 256

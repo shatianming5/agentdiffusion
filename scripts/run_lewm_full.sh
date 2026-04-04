@@ -40,7 +40,7 @@ echo "=== Phase 2: Train LeWorldModel with Decoder (50K steps) ==="
     lewm.pred_depth=6 lewm.pred_heads=8 \
     lewm.enc_mlp_ratio=4.0 lewm.pred_mlp_ratio=2.0 \
     lewm.num_projections=512 lewm.lambda_sigreg=0.5 \
-    lewm.lambda_price=10.0 lewm.lambda_returns=5.0 \
+    lewm.lambda_price=1.0 lewm.lambda_returns=1.0 \
     lewm.use_decoder=true \
     lewm.d_dec=256 lewm.dec_depth=4 lewm.dec_heads=4 lewm.dec_mlp_ratio=4.0 \
     lewm.lambda_recon=1.0 \
@@ -81,7 +81,7 @@ model = LeWorldModel(
     patch_size=4, enc_depth=6, enc_heads=8, pred_depth=6, pred_heads=8,
     enc_mlp_ratio=4.0, pred_mlp_ratio=2.0,
     num_projections=512, lambda_sigreg=0.5, lambda_recon=1.0,
-    lambda_price=10.0, lambda_returns=5.0, beta_leverage=0.5,
+    lambda_price=1.0, lambda_returns=1.0, beta_leverage=0.5,
     use_decoder=True, d_dec=256, dec_depth=4, dec_heads=4, dec_mlp_ratio=4.0,
     dec_grid_h=PAD_H, dec_grid_w=PAD_W,
 ).to(device)

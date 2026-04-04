@@ -197,7 +197,7 @@ class ReturnDistributionHead(nn.Module):
         """
         out = self.net(ctx)
         mu, log_sigma, log_nu = out.chunk(3, dim=-1)
-        sigma = F.softplus(log_sigma) + 1e-4
+        sigma = F.softplus(log_sigma).clamp(min=0.01, max=5.0)  # floor prevents NLL collapse
         nu = 2.0 + F.softplus(log_nu)  # df > 2 for finite variance
         return mu.squeeze(-1), sigma.squeeze(-1), nu.squeeze(-1)
 
@@ -497,9 +497,13 @@ class LeWorldModel(nn.Module):
         # Adjust sigma with leverage term
         sigma = sigma * (1.0 + self.beta_leverage * neg_shock)
 
-        # Student-t NLL on returns
+        # Student-t NLL on returns (clamped to prevent unbounded negative loss)
         dist = StudentT(df=nu, loc=mu, scale=sigma)
-        loss_ret_nll = -dist.log_prob(ret_gt).mean()
+        nll_raw = -dist.log_prob(ret_gt)
+        loss_ret_nll = nll_raw.clamp(min=-10.0, max=10.0).mean()
+
+        # Sigma floor penalty: discourage sigma from being too small
+        loss_sigma_floor = F.relu(0.005 - sigma).mean() * 100.0
 
         # Residual whiteness penalty (encourage no autocorrelation in residuals)
         residuals = ((ret_gt - mu) / sigma).detach()
@@ -508,7 +512,8 @@ class LeWorldModel(nn.Module):
         # lambda_price -> weight for return NLL; lambda_returns -> weight for whiteness
         loss_total = (loss_total
                       + self.lambda_price * loss_ret_nll
-                      + self.lambda_returns * loss_white)
+                      + self.lambda_returns * loss_white
+                      + loss_sigma_floor)
 
         return LeWMLossOutput(
             loss_total=loss_total,
