@@ -18,9 +18,10 @@ class AgentType(IntEnum):
 
 
 # 每种 agent 类型在 128 维状态向量中的语义分段
+# NOTE: ABIDES 单资产模式下，只有 dim 0 是持仓，dim 1 是相对现金
 STATE_SLICES = {
-    "positions":   slice(0, 32),    # 各资产持有量
-    "funds":       slice(32, 48),   # 现金、杠杆、保证金
+    "positions":   slice(0, 1),     # 持仓量（单资产: 仅 dim 0）
+    "funds":       slice(1, 4),     # 相对现金[1], leverage[2], PnL[3]
     "strategy":    slice(48, 64),   # agent 类型编码 + 策略超参
     "history":     slice(64, 80),   # 近期收益、波动率、夏普
     "behavior":    slice(80, 96),   # 下单频率、撤单率

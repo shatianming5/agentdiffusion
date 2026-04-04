@@ -193,11 +193,9 @@ class DiffusionTrainer:
                     log_price_t1 - log_price_t,
                 ) * w_return
 
-                # Total loss: diffusion (primary) + constraints + price dynamics (auxiliary)
-                loss = (diff_loss
-                        + constraint_out["constraint_total"]
-                        + loss_price
-                        + loss_return)
+                # Total loss: diffusion (primary) + price dynamics (auxiliary)
+                # NOTE: constraint loss is detached (no grad) — log only, don't add to backward
+                loss = diff_loss + loss_price + loss_return
 
                 self.optimizer.zero_grad()
                 loss.backward()
