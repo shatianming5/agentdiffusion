@@ -135,11 +135,10 @@ class LeWMTrainer:
     def _train_step_rollout(self, batch: dict[str, torch.Tensor]):
         """Multi-step unrolled training over K consecutive transitions.
 
-        Accumulates prediction, reconstruction, and return distribution losses
-        at each step with temporal discounting (gamma^k).
+        Accumulates prediction, reconstruction, and return MSE / volatility
+        matching losses at each step with temporal discounting (gamma^k).
         """
         import torch.nn.functional as F_fn
-        from torch.distributions import StudentT
 
         seq_states = batch["seq_states"].to(self.device)   # [B, K+1, H, W, C]
         seq_conds = batch["seq_conds"].to(self.device)     # [B, K, cond_dim]
@@ -154,8 +153,8 @@ class LeWMTrainer:
 
         loss_total = torch.tensor(0.0, device=self.device)
         loss_pred_acc = torch.tensor(0.0, device=self.device)
-        loss_ret_nll_acc = torch.tensor(0.0, device=self.device)
-        loss_white_acc = torch.tensor(0.0, device=self.device)
+        loss_ret_mse_acc = torch.tensor(0.0, device=self.device)
+        loss_vol_acc = torch.tensor(0.0, device=self.device)
         loss_recon_acc = torch.tensor(0.0, device=self.device)
 
         z_t1_pred_last = None
@@ -186,7 +185,7 @@ class LeWMTrainer:
                 step_recon = F_fn.mse_loss(decoded, state_kp1)
                 loss_recon_acc = loss_recon_acc + discount * step_recon
 
-            # --- Return distribution loss (Student-t NLL) at each rollout step ---
+            # --- Return MSE + volatility matching at each rollout step ---
             mask_hw = (state_k[..., 0] != 0) | (state_k[..., 1] != 0)  # [B, H, W]
             price_kp1_gt = masked_mean(state_kp1[..., 98], mask_hw, dims=(1, 2))  # [B]
 
@@ -194,23 +193,25 @@ class LeWMTrainer:
             ret_gt = (torch.log(price_kp1_gt.clamp(min=0.01))
                       - torch.log(prev_price.clamp(min=0.01)))
 
-            # Predict Student-t parameters from predicted latent
-            mu, sigma, nu = self.model.return_dist_head(z_pred)
+            # Data-std based sigma floor
+            data_std = ret_gt.detach().std().clamp(min=1e-6)
+            sigma_floor = (data_std * 0.5).item()
+
+            # Predict return distribution parameters from predicted latent
+            mu, sigma, nu = self.model.return_dist_head(z_pred, sigma_floor=sigma_floor)
 
             # Asymmetric volatility (leverage effect)
             ret_prev_cond = cond_k[:, 5]  # previous return from market_cond
             neg_shock = F_fn.relu(-ret_prev_cond)
             sigma = sigma * (1.0 + self.model.beta_leverage * neg_shock)
 
-            # Student-t NLL
-            dist = StudentT(df=nu, loc=mu, scale=sigma)
-            step_ret_nll = -dist.log_prob(ret_gt).mean()
-            loss_ret_nll_acc = loss_ret_nll_acc + discount * step_ret_nll
+            # MSE on predicted vs actual returns
+            step_ret_mse = F_fn.mse_loss(mu, ret_gt)
+            loss_ret_mse_acc = loss_ret_mse_acc + discount * step_ret_mse
 
-            # Whiteness penalty
-            residuals = ((ret_gt - mu) / sigma).detach()
-            step_white = residuals.pow(2).mean() * 0.1
-            loss_white_acc = loss_white_acc + discount * step_white
+            # Volatility matching
+            step_vol = F_fn.mse_loss(sigma, ret_gt.detach().abs())
+            loss_vol_acc = loss_vol_acc + discount * step_vol
 
             # Update previous price for next step
             prev_price = price_kp1_gt
@@ -224,13 +225,13 @@ class LeWMTrainer:
         # Combine accumulated losses
         w_pred = 1.0
         w_recon = self.model.lambda_recon if self.model.decoder is not None else 0.0
-        w_ret_nll = self.model.lambda_price      # repurposed
-        w_white = self.model.lambda_returns       # repurposed
+        w_ret_mse = self.model.lambda_price
+        w_vol = self.model.lambda_returns
 
         loss_total = (w_pred * loss_pred_acc
                       + w_recon * loss_recon_acc
-                      + w_ret_nll * loss_ret_nll_acc
-                      + w_white * loss_white_acc)
+                      + w_ret_mse * loss_ret_mse_acc
+                      + w_vol * loss_vol_acc)
 
         # SIGReg on final latents (do once, not per step)
         z_all = torch.cat([self.model.encode(seq_states[:, 0]), z], dim=0)
@@ -251,9 +252,10 @@ class LeWMTrainer:
             loss_pred=loss_pred_acc,
             loss_sigreg=loss_reg,
             loss_recon=loss_recon_acc if self.model.decoder is not None else None,
-            loss_price=loss_ret_nll_acc,     # repurposed field
-            loss_returns=loss_white_acc,     # repurposed field
-            loss_ret_nll=loss_ret_nll_acc,
+            loss_price=loss_ret_mse_acc,
+            loss_returns=loss_vol_acc,
+            loss_ret_mse=loss_ret_mse_acc,
+            loss_vol=loss_vol_acc,
             z_t=self.model.encode(seq_states[:, 0]),
             z_t1_target=z_t1_target_last if z_t1_target_last is not None else torch.zeros(1, device=self.device),
             z_t1_pred=z_t1_pred_last if z_t1_pred_last is not None else torch.zeros(1, device=self.device),
@@ -314,10 +316,10 @@ class LeWMTrainer:
                     )
                     if loss_out.loss_recon is not None:
                         postfix["recon"] = f"{loss_out.loss_recon.item():.4f}"
-                    if loss_out.loss_ret_nll is not None:
-                        postfix["ret_nll"] = f"{loss_out.loss_ret_nll.item():.4f}"
-                    if loss_out.loss_returns is not None:
-                        postfix["white"] = f"{loss_out.loss_returns.item():.4f}"
+                    if loss_out.loss_ret_mse is not None:
+                        postfix["ret_mse"] = f"{loss_out.loss_ret_mse.item():.4f}"
+                    if loss_out.loss_vol is not None:
+                        postfix["vol"] = f"{loss_out.loss_vol.item():.4f}"
                     pbar.set_postfix(**postfix)
 
                 # Checkpoint

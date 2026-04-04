@@ -36,9 +36,10 @@ class LeWMLossOutput:
     loss_pred: torch.Tensor
     loss_sigreg: torch.Tensor
     loss_recon: torch.Tensor | None
-    loss_price: torch.Tensor | None       # repurposed: now holds return NLL weight contribution
-    loss_returns: torch.Tensor | None     # repurposed: now holds whiteness penalty contribution
-    loss_ret_nll: torch.Tensor | None     # Student-t NLL on returns
+    loss_price: torch.Tensor | None       # repurposed: now holds return MSE contribution
+    loss_returns: torch.Tensor | None     # repurposed: now holds volatility matching contribution
+    loss_ret_mse: torch.Tensor | None     # MSE on predicted vs actual returns
+    loss_vol: torch.Tensor | None         # MSE between predicted sigma and realised |return|
     z_t: torch.Tensor
     z_t1_target: torch.Tensor
     z_t1_pred: torch.Tensor
@@ -179,20 +180,23 @@ class ReturnDistributionHead(nn.Module):
             nn.Linear(d_hidden, 3),  # mu, log_sigma, log_nu
         )
 
-    def forward(self, ctx: torch.Tensor):
-        """Predict Student-t parameters.
+    def forward(self, ctx: torch.Tensor, sigma_floor: float = 0.01):
+        """Predict return distribution parameters.
 
         Args:
             ctx: Context vector [B, d_input].
+            sigma_floor: Minimum sigma value (default 0.01, caller may
+                         pass data_std-based floor for better calibration).
 
         Returns:
             mu:    [B] location parameter
-            sigma: [B] scale parameter (> 0)
+            sigma: [B] scale parameter (>= sigma_floor)
             nu:    [B] degrees of freedom (> 2)
         """
         out = self.net(ctx)
         mu, log_sigma, log_nu = out.chunk(3, dim=-1)
-        sigma = F.softplus(log_sigma).clamp(min=0.01, max=5.0)  # floor prevents NLL collapse
+        floor_t = torch.tensor(sigma_floor, device=out.device, dtype=out.dtype)
+        sigma = torch.maximum(F.softplus(log_sigma), floor_t).clamp(max=5.0)
         nu = 2.0 + F.softplus(log_nu)  # df > 2 for finite variance
         return mu.squeeze(-1), sigma.squeeze(-1), nu.squeeze(-1)
 
@@ -405,13 +409,13 @@ class LeWorldModel(nn.Module):
         state_t1: torch.Tensor,
         market_cond: torch.Tensor,
     ) -> LeWMLossOutput:
-        """Compute full LeWM training loss with Student-t return distribution.
+        """Compute full LeWM training loss with return MSE + volatility matching.
 
         Without decoder:
-            L_total = L_pred + L_reg + lambda_price * L_ret_nll + lambda_returns * L_white
+            L_total = L_pred + L_reg + lambda_price * L_ret_mse + lambda_returns * L_vol
         With decoder:
             L_total = L_pred + L_reg + lambda_recon * L_recon
-                      + lambda_price * L_ret_nll + lambda_returns * L_white
+                      + lambda_price * L_ret_mse + lambda_returns * L_vol
 
         Both states are encoded by the same encoder (end-to-end,
         no stop-gradient on the target -- following the paper).
@@ -424,8 +428,6 @@ class LeWorldModel(nn.Module):
         Returns:
             LeWMLossOutput with all loss components and latent vectors.
         """
-        from torch.distributions import StudentT
-
         # Encode both states (no stop-gradient, no EMA)
         z_t = self.encoder(state_t)       # [B, d_latent]
         z_t1 = self.encoder(state_t1)     # [B, d_latent]
@@ -471,53 +473,57 @@ class LeWorldModel(nn.Module):
             )
             loss_total = loss_total + self.lambda_recon * loss_recon
 
-        # --- Student-t return distribution loss ---
-        # Extract ground truth prices from raw states (dim 98 = normalized mid price).
-        # Use mask to exclude padding agents (padding has all-zero features).
-        mask_hw = (state_t[..., 0] != 0) | (state_t[..., 1] != 0)  # [B, H, W]
-        price_t_gt = masked_mean(state_t[..., 98], mask_hw, dims=(1, 2))    # [B]
-        price_t1_gt = masked_mean(state_t1[..., 98], mask_hw, dims=(1, 2))  # [B]
+        # --- Return MSE + volatility matching loss ---
+        # Adaptive: use dim 98 for ABIDES (128-dim), dim 0 for crypto (32-dim)
+        d_agent = state_t.shape[-1]
+        if d_agent > 64:
+            # ABIDES mode: dim 98 = normalized mid price
+            price_dim = 98
+            mask_hw = (state_t[..., 0] != 0) | (state_t[..., 1] != 0)
+            price_t_gt = masked_mean(state_t[..., price_dim], mask_hw, dims=(1, 2))
+            price_t1_gt = masked_mean(state_t1[..., price_dim], mask_hw, dims=(1, 2))
+            ret_gt = (torch.log(price_t1_gt.clamp(min=0.01))
+                      - torch.log(price_t_gt.clamp(min=0.01)))
+        else:
+            # Crypto mode: dim 0 = normalized log_return, use mean across window
+            B = state_t.shape[0]
+            ret_t = state_t.reshape(B, -1, d_agent)[:, :, 0].mean(dim=1)
+            ret_t1 = state_t1.reshape(B, -1, d_agent)[:, :, 0].mean(dim=1)
+            ret_gt = ret_t1 - ret_t
 
-        # Ground-truth log-return
-        ret_gt = (torch.log(price_t1_gt.clamp(min=0.01))
-                  - torch.log(price_t_gt.clamp(min=0.01)))
+        # Data-std based sigma floor for better calibration
+        data_std = ret_gt.detach().std().clamp(min=1e-6)
+        sigma_floor = (data_std * 0.5).item()
 
-        # Predict Student-t parameters from predicted latent
-        mu, sigma, nu = self.return_dist_head(z_t1_pred)
+        # Predict return distribution parameters from predicted latent
+        mu, sigma, nu = self.return_dist_head(z_t1_pred, sigma_floor=sigma_floor)
 
         # Asymmetric volatility (leverage effect):
         # sigma increases after negative returns
         ret_prev = market_cond[:, 5]  # previous return from market_cond (dim 5 = log_return at t)
         neg_shock = F.relu(-ret_prev)
-        # Adjust sigma with leverage term
         sigma = sigma * (1.0 + self.beta_leverage * neg_shock)
 
-        # Student-t NLL on returns (clamped to prevent unbounded negative loss)
-        dist = StudentT(df=nu, loc=mu, scale=sigma)
-        nll_raw = -dist.log_prob(ret_gt)
-        loss_ret_nll = nll_raw.clamp(min=-10.0, max=10.0).mean()
+        # MSE on predicted vs actual returns
+        loss_ret_mse = F.mse_loss(mu, ret_gt)
 
-        # Sigma floor penalty: discourage sigma from being too small
-        loss_sigma_floor = F.relu(0.005 - sigma).mean() * 100.0
+        # Volatility matching: MSE between predicted sigma and realised |return|
+        loss_vol = F.mse_loss(sigma, ret_gt.detach().abs())
 
-        # Residual whiteness penalty (encourage no autocorrelation in residuals)
-        residuals = ((ret_gt - mu) / sigma).detach()
-        loss_white = residuals.pow(2).mean() * 0.1
-
-        # lambda_price -> weight for return NLL; lambda_returns -> weight for whiteness
+        # lambda_price -> weight for return MSE; lambda_returns -> weight for vol matching
         loss_total = (loss_total
-                      + self.lambda_price * loss_ret_nll
-                      + self.lambda_returns * loss_white
-                      + loss_sigma_floor)
+                      + self.lambda_price * loss_ret_mse
+                      + self.lambda_returns * loss_vol)
 
         return LeWMLossOutput(
             loss_total=loss_total,
             loss_pred=loss_pred,
             loss_sigreg=loss_reg,  # report combined reg loss
             loss_recon=loss_recon,
-            loss_price=loss_ret_nll,     # repurposed field
-            loss_returns=loss_white,     # repurposed field
-            loss_ret_nll=loss_ret_nll,
+            loss_price=loss_ret_mse,     # repurposed field
+            loss_returns=loss_vol,       # repurposed field
+            loss_ret_mse=loss_ret_mse,
+            loss_vol=loss_vol,
             z_t=z_t,
             z_t1_target=z_t1,
             z_t1_pred=z_t1_pred,

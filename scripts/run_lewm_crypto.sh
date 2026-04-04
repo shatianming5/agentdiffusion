@@ -85,22 +85,27 @@ echo "=== Phase 2: Train LeWorldModel on crypto (50K steps) ==="
     output_dir=outputs/lewm_crypto
 
 # -------------------------------------------------------
-# Phase 3: Full evaluation with stylized facts
+# Phase 3: Full evaluation (20 trials, Wasserstein distance)
 # -------------------------------------------------------
 echo ""
-echo "=== Phase 3: Full Evaluation ==="
+echo "=== Phase 3: Full Evaluation (20 trials) ==="
 .venv/bin/python3 << 'PYEOF'
 import sys
 import numpy as np
 import torch
 from pathlib import Path
+import time
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
 
 from agentdiffusion.models.lewm import LeWorldModel
 from agentdiffusion.data.crypto_dataset import CryptoKlineDataset
-from agentdiffusion.eval.stylized_facts import evaluate_stylized_facts
+from agentdiffusion.eval.stylized_facts import (
+    evaluate_stylized_facts,
+    compute_returns,
+    return_distribution_wasserstein,
+)
 
 # Build model with crypto dimensions
 model = LeWorldModel(
@@ -135,6 +140,7 @@ dataset = CryptoKlineDataset(
     grid_h=8,
     grid_w=8,
 )
+norm_params = dataset.get_normalisation_params()
 
 # -------------------------------------------------------
 # Evaluation 1: Single-step prediction quality
@@ -178,84 +184,104 @@ if model.decoder is not None:
     print(f"  Reconstruction MSE: {np.mean(recon_mses):.6f}")
 
 # -------------------------------------------------------
-# Evaluation 3: Long rollout (1000 steps) + stylized facts
+# Evaluation 3: 20-trial rollout evaluation
 # -------------------------------------------------------
-print("\n=== 1000-step Rollout + Stylized Facts ===")
-start_idx = len(dataset) // 4
-sample = dataset[start_idx]
-state_t = sample["state_t"].unsqueeze(0).to(device)
-market_cond = sample["market_cond"].unsqueeze(0).to(device)
-norm_params = dataset.get_normalisation_params()
-
+NUM_TRIALS = 20
 ROLLOUT_STEPS = 1000
-generated_returns = []
-generated_volumes = []
+ret_scale = norm_params["iqr"][0]
+ret_center = norm_params["medians"][0]
 
-with torch.no_grad():
-    z = model.encode(state_t)
+# Spread starting points evenly across the dataset
+ds_len = len(dataset)
+start_indices = [int(ds_len * (i + 1) / (NUM_TRIALS + 1)) for i in range(NUM_TRIALS)]
 
-    for step in range(ROLLOUT_STEPS):
-        z_next = model.predict(z, market_cond, stochastic=False)
+print(f"\n=== {NUM_TRIALS}-trial Rollout Evaluation ({ROLLOUT_STEPS} steps each) ===")
 
-        # Extract return from distribution head
-        mu, sigma, nu = model.return_dist_head(z_next)
-        generated_returns.append(mu.item())
+trial_wasserstein = []
+trial_stylized_passed = []
+trial_ret_stds = []
 
-        # Decode and extract volume signal
-        if model.decoder is not None:
-            decoded = model.decode(z_next)
-            flat = decoded.reshape(1, -1, 32)
-            # Feature col 1 = normalised log_volume
-            log_vol_normed = flat[0, :, 1].mean().item()
-            # Inverse normalise: val * iqr + median
-            log_vol = log_vol_normed * norm_params["iqr"][1] + norm_params["medians"][1]
-            vol = max(np.exp(log_vol) - 1.0, 0.0)
-            generated_volumes.append(vol)
+# Collect all GT returns once (from the full close price series)
+all_gt_prices = dataset.get_close_prices(0, ds_len + ROLLOUT_STEPS + 100)
+all_gt_returns = compute_returns(all_gt_prices)
 
-            # Update market_cond with decoded features
-            mean_ret = flat[0, :, 0].mean().item()
-            mc_np = market_cond.cpu().numpy()[0].copy()
-            mc_np[0] = mean_ret
-            mc_np[7] = mean_ret
-            market_cond = torch.from_numpy(mc_np).unsqueeze(0).float().to(device)
-        else:
-            generated_volumes.append(100.0)  # fallback
+for trial_idx, start_idx in enumerate(start_indices):
+    sample = dataset[start_idx]
+    state_t = sample["state_t"].unsqueeze(0).to(device)
+    market_cond = sample["market_cond"].unsqueeze(0).to(device)
 
-        z = z_next
+    generated_returns = []
+    generated_volumes = []
 
-# Construct price series from returns
-gen_returns = np.array(generated_returns)
-# Scale returns: the normalised returns need to be mapped back
-# Feature col 0 = log_return, normalised with median/iqr
-ret_scale = norm_params["iqr"][0]  # IQR of log_return
-ret_center = norm_params["medians"][0]  # median of log_return
-raw_returns = gen_returns * ret_scale + ret_center
-gen_prices = np.exp(np.cumsum(raw_returns)) * dataset.close_prices[start_idx]
-gen_volumes = np.array(generated_volumes)
+    with torch.no_grad():
+        z = model.encode(state_t)
 
-# Ground truth
-gt_prices = dataset.get_close_prices(start_idx, ROLLOUT_STEPS + 100)
-gt_volumes = dataset.get_volumes(start_idx, ROLLOUT_STEPS + 100)
+        for step in range(ROLLOUT_STEPS):
+            z_next = model.predict(z, market_cond, stochastic=False)
 
-print(f"\nGenerated price range: [{gen_prices.min():.2f}, {gen_prices.max():.2f}]")
-print(f"GT price range:       [{gt_prices[:ROLLOUT_STEPS].min():.2f}, {gt_prices[:ROLLOUT_STEPS].max():.2f}]")
-print(f"Generated return std:  {gen_returns.std():.6f}")
-print(f"GT return std:         {np.diff(np.log(gt_prices[:ROLLOUT_STEPS+1]+1e-10)).std():.6f}")
+            mu, sigma, nu = model.return_dist_head(z_next)
+            generated_returns.append(mu.item())
 
-# Stylized facts on generated data
-print("\n--- Stylized Facts (Generated) ---")
-gen_report = evaluate_stylized_facts(gen_prices, gen_volumes[:len(gen_prices)])
-print(f"  Fat tails:              {'PASS' if gen_report.fat_tail_pass else 'FAIL'} (alpha={gen_report.fat_tail_alpha:.2f})")
-print(f"  Volatility clustering:  {'PASS' if gen_report.volatility_clustering_pass else 'FAIL'}")
-print(f"  Leverage effect:        {'PASS' if gen_report.leverage_effect_pass else 'FAIL'} (corr={gen_report.leverage_effect_corr:.4f})")
-print(f"  Vol-volume corr:        {'PASS' if gen_report.volume_volatility_pass else 'FAIL'} (corr={gen_report.volume_volatility_corr:.4f})")
-print(f"  Return autocorr:        {'PASS' if gen_report.return_autocorr_pass else 'FAIL'}")
-print(f"  Gain-loss asymmetry:    {'PASS' if gen_report.gain_loss_asymmetry_pass else 'FAIL'} (p={gen_report.gain_loss_asymmetry_pvalue:.4f})")
-print(f"  TOTAL: {gen_report.summary}")
+            if model.decoder is not None:
+                decoded = model.decode(z_next)
+                flat = decoded.reshape(1, -1, 32)
+                log_vol_normed = flat[0, :, 1].mean().item()
+                log_vol = log_vol_normed * norm_params["iqr"][1] + norm_params["medians"][1]
+                vol = max(np.exp(log_vol) - 1.0, 0.0)
+                generated_volumes.append(vol)
 
-# Stylized facts on ground truth
-print("\n--- Stylized Facts (Ground Truth BTC) ---")
-gt_report = evaluate_stylized_facts(gt_prices[:ROLLOUT_STEPS], gt_volumes[:ROLLOUT_STEPS])
+                mean_ret = flat[0, :, 0].mean().item()
+                mc_np = market_cond.cpu().numpy()[0].copy()
+                mc_np[0] = mean_ret
+                mc_np[7] = mean_ret
+                market_cond = torch.from_numpy(mc_np).unsqueeze(0).float().to(device)
+            else:
+                generated_volumes.append(100.0)
+
+            z = z_next
+
+    gen_returns = np.array(generated_returns)
+    raw_returns = gen_returns * ret_scale + ret_center
+    gen_prices = np.exp(np.cumsum(raw_returns)) * dataset.close_prices[start_idx]
+    gen_volumes = np.array(generated_volumes)
+
+    # Compute generated log-returns for Wasserstein
+    gen_log_returns = compute_returns(gen_prices)
+
+    # Ground truth segment for this trial
+    gt_seg_prices = dataset.get_close_prices(start_idx, ROLLOUT_STEPS + 100)
+    gt_seg_returns = compute_returns(gt_seg_prices[:ROLLOUT_STEPS])
+
+    # Wasserstein distance
+    w_dist = return_distribution_wasserstein(gen_log_returns, gt_seg_returns)
+    trial_wasserstein.append(w_dist)
+
+    # Stylized facts
+    gen_report = evaluate_stylized_facts(gen_prices, gen_volumes[:len(gen_prices)])
+    trial_stylized_passed.append(gen_report.total_passed)
+    trial_ret_stds.append(gen_returns.std())
+
+    print(f"  Trial {trial_idx+1:2d} (start={start_idx:6d}): "
+          f"stylized={gen_report.total_passed}/6  "
+          f"W-dist={w_dist:.6f}  "
+          f"ret_std={gen_returns.std():.6f}")
+
+# Summary statistics
+w_arr = np.array(trial_wasserstein)
+sf_arr = np.array(trial_stylized_passed)
+rs_arr = np.array(trial_ret_stds)
+
+print(f"\n=== 20-Trial Summary ===")
+print(f"  Wasserstein distance: {w_arr.mean():.6f} +/- {w_arr.std():.6f}")
+print(f"  Stylized facts passed: {sf_arr.mean():.2f} +/- {sf_arr.std():.2f} out of 6")
+print(f"  Generated return std:  {rs_arr.mean():.6f} +/- {rs_arr.std():.6f}")
+print(f"  GT return std:         {np.std(all_gt_returns):.6f}")
+
+# Ground truth stylized facts (single reference)
+gt_prices_ref = dataset.get_close_prices(ds_len // 4, ROLLOUT_STEPS + 100)
+gt_volumes_ref = dataset.get_volumes(ds_len // 4, ROLLOUT_STEPS + 100)
+gt_report = evaluate_stylized_facts(gt_prices_ref[:ROLLOUT_STEPS], gt_volumes_ref[:ROLLOUT_STEPS])
+print(f"\n--- Stylized Facts (Ground Truth BTC reference) ---")
 print(f"  Fat tails:              {'PASS' if gt_report.fat_tail_pass else 'FAIL'} (alpha={gt_report.fat_tail_alpha:.2f})")
 print(f"  Volatility clustering:  {'PASS' if gt_report.volatility_clustering_pass else 'FAIL'}")
 print(f"  Leverage effect:        {'PASS' if gt_report.leverage_effect_pass else 'FAIL'} (corr={gt_report.leverage_effect_corr:.4f})")
@@ -267,16 +293,18 @@ print(f"  TOTAL: {gt_report.summary}")
 # -------------------------------------------------------
 # Evaluation 4: Speed benchmark
 # -------------------------------------------------------
-import time
 print("\n=== Speed Benchmark ===")
-z_test = model.encode(state_t)
+sample0 = dataset[0]
+state_t_bench = sample0["state_t"].unsqueeze(0).to(device)
+mc_bench = sample0["market_cond"].unsqueeze(0).to(device)
+z_test = model.encode(state_t_bench)
 if device.type == "cuda":
     torch.cuda.synchronize()
 
 t0 = time.perf_counter()
 with torch.no_grad():
     for _ in range(1000):
-        z_test = model.predict(z_test, market_cond)
+        z_test = model.predict(z_test, mc_bench)
 if device.type == "cuda":
     torch.cuda.synchronize()
 t1 = time.perf_counter()

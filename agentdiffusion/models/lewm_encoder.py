@@ -147,9 +147,10 @@ class LeWMEncoder(nn.Module):
         for block in self.blocks:
             tokens = block(tokens)
 
-        # Extract CLS token, project to latent
-        cls_out = self.norm(tokens[:, 0])  # [B, d_enc]
-        z = self.head(cls_out)  # [B, d_latent]
+        # Mean pooling over patch tokens (exclude CLS at position 0)
+        patch_out = self.norm(tokens[:, 1:])  # [B, N, d_enc]
+        pooled = patch_out.mean(dim=1)  # [B, d_enc]
+        z = self.head(pooled)  # [B, d_latent]
         return z
 
     def forward_patch_tokens(self, x: torch.Tensor) -> torch.Tensor:

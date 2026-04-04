@@ -45,6 +45,25 @@ def compute_returns(prices: np.ndarray) -> np.ndarray:
     return np.diff(np.log(prices + 1e-10))
 
 
+def return_distribution_wasserstein(
+    gen_returns: np.ndarray,
+    real_returns: np.ndarray,
+) -> float:
+    """1-D Wasserstein (Earth Mover's) distance between generated and real return distributions.
+
+    Lower is better -- measures how much "work" is needed to transform
+    the generated return distribution into the real one.
+
+    Args:
+        gen_returns: Generated log-returns [T_gen].
+        real_returns: Real log-returns [T_real].
+
+    Returns:
+        Wasserstein-1 distance (float).
+    """
+    return float(stats.wasserstein_distance(gen_returns, real_returns))
+
+
 def hill_estimator(returns: np.ndarray, k: int | None = None) -> float:
     """Hill estimator for tail index α.
 

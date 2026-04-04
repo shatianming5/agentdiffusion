@@ -242,7 +242,7 @@ class CryptoLeWMTrainer:
             )
             loss_total = loss_total + self.model.lambda_recon * loss_recon
 
-        # --- Crypto return distribution loss ---
+        # --- Crypto return MSE + volatility matching loss ---
         # Extract log-return directly from features. In our grid reshape:
         # state [B, H, W, feature_dim] -> flatten back to [B, H*W, feature_dim]
         # Feature column 0 = normalised log_return per bar.
@@ -252,43 +252,46 @@ class CryptoLeWMTrainer:
         ret_t1 = state_t1.reshape(B, -1, state_t1.shape[-1])[:, :, 0].mean(dim=1)  # [B]
 
         # Ground truth: difference in mean return between windows
-        # This captures the directional shift
         ret_gt = ret_t1 - ret_t
 
-        # Predict Student-t parameters
-        from torch.distributions import StudentT
-        mu, sigma, nu = self.model.return_dist_head(z_t1_pred)
+        # Data-std based sigma floor
+        data_std = ret_gt.detach().std().clamp(min=1e-6)
+        sigma_floor = (data_std * 0.5).item()
+
+        mu, sigma, nu = self.model.return_dist_head(z_t1_pred, sigma_floor=sigma_floor)
 
         # Leverage effect
         ret_prev = market_cond[:, 7]  # previous return from cond slot 7
         neg_shock = F.relu(-ret_prev)
         sigma = sigma * (1.0 + self.model.beta_leverage * neg_shock)
 
-        # Student-t NLL
-        dist = StudentT(df=nu, loc=mu, scale=sigma)
-        nll_raw = -dist.log_prob(ret_gt)
-        loss_ret_nll = nll_raw.clamp(min=-10.0, max=10.0).mean()
+        # MSE on predicted vs actual returns
+        loss_ret_mse = F.mse_loss(mu, ret_gt)
 
-        # Sigma floor penalty
-        loss_sigma_floor = F.relu(0.005 - sigma).mean() * 100.0
-
-        # Whiteness penalty
-        residuals = ((ret_gt - mu) / sigma).detach()
-        loss_white = residuals.pow(2).mean() * 0.1
+        # Volatility matching: MSE between predicted sigma and realised |return|
+        loss_vol = F.mse_loss(sigma, ret_gt.detach().abs())
 
         loss_total = (loss_total
-                      + self.model.lambda_price * loss_ret_nll
-                      + self.model.lambda_returns * loss_white
-                      + loss_sigma_floor)
+                      + self.model.lambda_price * loss_ret_mse
+                      + self.model.lambda_returns * loss_vol)
+
+        # --- Fix 4: Return reconstruction auxiliary loss ---
+        loss_ret_recon = torch.tensor(0.0, device=state_t.device)
+        if self.model.decoder is not None:
+            decoded_pred = self.model.decode(z_t1_pred)  # [B, H, W, C]
+            pred_ret = decoded_pred.reshape(B, -1, decoded_pred.shape[-1])[:, :, 0].mean(dim=1)
+            loss_ret_recon = F.mse_loss(pred_ret, ret_gt.detach())
+            loss_total = loss_total + loss_ret_recon
 
         return LeWMLossOutput(
             loss_total=loss_total,
             loss_pred=loss_pred,
             loss_sigreg=loss_reg,
             loss_recon=loss_recon,
-            loss_price=loss_ret_nll,
-            loss_returns=loss_white,
-            loss_ret_nll=loss_ret_nll,
+            loss_price=loss_ret_mse,
+            loss_returns=loss_vol,
+            loss_ret_mse=loss_ret_mse,
+            loss_vol=loss_vol,
             z_t=z_t,
             z_t1_target=z_t1,
             z_t1_pred=z_t1_pred,
@@ -302,8 +305,6 @@ class CryptoLeWMTrainer:
 
     def _train_step_rollout(self, batch: dict[str, torch.Tensor]) -> LeWMLossOutput:
         """Multi-step rollout training for crypto sequences."""
-        from torch.distributions import StudentT
-
         seq_states = batch["seq_states"].to(self.device)  # [B, K+1, H, W, C]
         seq_conds = batch["seq_conds"].to(self.device)    # [B, K, cond_dim]
 
@@ -316,8 +317,8 @@ class CryptoLeWMTrainer:
 
         loss_total = torch.tensor(0.0, device=self.device)
         loss_pred_acc = torch.tensor(0.0, device=self.device)
-        loss_ret_nll_acc = torch.tensor(0.0, device=self.device)
-        loss_white_acc = torch.tensor(0.0, device=self.device)
+        loss_ret_mse_acc = torch.tensor(0.0, device=self.device)
+        loss_vol_acc = torch.tensor(0.0, device=self.device)
         loss_recon_acc = torch.tensor(0.0, device=self.device)
 
         z_t1_pred_last = None
@@ -343,23 +344,34 @@ class CryptoLeWMTrainer:
                 step_recon = F.mse_loss(decoded, state_kp1)
                 loss_recon_acc = loss_recon_acc + discount * step_recon
 
-            # Return distribution loss (crypto-adapted)
+            # Return distribution loss (crypto-adapted, MSE approach)
             ret_k = state_k.reshape(B, -1, C)[:, :, 0].mean(dim=1)
             ret_kp1 = state_kp1.reshape(B, -1, C)[:, :, 0].mean(dim=1)
             ret_gt = ret_kp1 - ret_k
 
-            mu, sigma, nu = self.model.return_dist_head(z_pred)
+            # Data-std based sigma floor
+            data_std = ret_gt.detach().std().clamp(min=1e-6)
+            sigma_floor = (data_std * 0.5).item()
+
+            mu, sigma, nu = self.model.return_dist_head(z_pred, sigma_floor=sigma_floor)
             ret_prev = cond_k[:, 7]
             neg_shock = F.relu(-ret_prev)
             sigma = sigma * (1.0 + self.model.beta_leverage * neg_shock)
 
-            dist = StudentT(df=nu, loc=mu, scale=sigma)
-            step_ret_nll = -dist.log_prob(ret_gt).clamp(min=-10.0, max=10.0).mean()
-            loss_ret_nll_acc = loss_ret_nll_acc + discount * step_ret_nll
+            # MSE on predicted vs actual returns
+            step_ret_mse = F.mse_loss(mu, ret_gt)
+            loss_ret_mse_acc = loss_ret_mse_acc + discount * step_ret_mse
 
-            residuals = ((ret_gt - mu) / sigma).detach()
-            step_white = residuals.pow(2).mean() * 0.1
-            loss_white_acc = loss_white_acc + discount * step_white
+            # Volatility matching
+            step_vol = F.mse_loss(sigma, ret_gt.detach().abs())
+            loss_vol_acc = loss_vol_acc + discount * step_vol
+
+            # Return reconstruction auxiliary loss (Fix 4)
+            if self.model.decoder is not None:
+                decoded_pred = self.model.decode(z_pred)
+                pred_ret = decoded_pred.reshape(B, -1, C)[:, :, 0].mean(dim=1)
+                step_ret_recon = F.mse_loss(pred_ret, ret_gt.detach())
+                loss_recon_acc = loss_recon_acc + discount * step_ret_recon
 
             z_t1_pred_last = z_pred
             z_t1_target_last = z_target
@@ -368,13 +380,13 @@ class CryptoLeWMTrainer:
         # Combine
         w_pred = 1.0
         w_recon = self.model.lambda_recon if self.model.decoder is not None else 0.0
-        w_ret_nll = self.model.lambda_price
-        w_white = self.model.lambda_returns
+        w_ret_mse = self.model.lambda_price
+        w_vol = self.model.lambda_returns
 
         loss_total = (w_pred * loss_pred_acc
                       + w_recon * loss_recon_acc
-                      + w_ret_nll * loss_ret_nll_acc
-                      + w_white * loss_white_acc)
+                      + w_ret_mse * loss_ret_mse_acc
+                      + w_vol * loss_vol_acc)
 
         # SIGReg on final latents
         z_all = torch.cat([self.model.encode(seq_states[:, 0]), z], dim=0)
@@ -393,9 +405,10 @@ class CryptoLeWMTrainer:
             loss_pred=loss_pred_acc,
             loss_sigreg=loss_reg,
             loss_recon=loss_recon_acc if self.model.decoder is not None else None,
-            loss_price=loss_ret_nll_acc,
-            loss_returns=loss_white_acc,
-            loss_ret_nll=loss_ret_nll_acc,
+            loss_price=loss_ret_mse_acc,
+            loss_returns=loss_vol_acc,
+            loss_ret_mse=loss_ret_mse_acc,
+            loss_vol=loss_vol_acc,
             z_t=self.model.encode(seq_states[:, 0]),
             z_t1_target=z_t1_target_last if z_t1_target_last is not None else torch.zeros(1, device=self.device),
             z_t1_pred=z_t1_pred_last if z_t1_pred_last is not None else torch.zeros(1, device=self.device),
@@ -464,8 +477,10 @@ class CryptoLeWMTrainer:
                     )
                     if loss_out.loss_recon is not None:
                         postfix["recon"] = f"{loss_out.loss_recon.item():.4f}"
-                    if loss_out.loss_ret_nll is not None:
-                        postfix["nll"] = f"{loss_out.loss_ret_nll.item():.4f}"
+                    if loss_out.loss_ret_mse is not None:
+                        postfix["ret_mse"] = f"{loss_out.loss_ret_mse.item():.4f}"
+                    if loss_out.loss_vol is not None:
+                        postfix["vol"] = f"{loss_out.loss_vol.item():.4f}"
                     pbar.set_postfix(**postfix)
 
                 # Checkpoint
