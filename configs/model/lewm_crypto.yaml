@@ -1,0 +1,45 @@
+agent:
+  raw_dim: 32          # feature_dim per bar (20 base features padded to 32)
+  latent_dim: 16
+  agent_types: 1       # single asset
+
+patch:
+  patch_size: 2        # 8/2 = 4 patches per side -> 16 total patches
+  grid_h: 8            # sqrt(64) = 8 -> 64 bars per window
+  grid_w: 8
+
+# LeWorldModel for crypto: same architecture, adapted dimensions
+lewm:
+  # Encoder (ViT-tiny adapted for 8x8 grid with 32-dim features)
+  d_enc: 256
+  d_latent: 256
+  enc_depth: 6
+  enc_heads: 8
+  enc_mlp_ratio: 4.0
+
+  # Predictor
+  d_pred: 384
+  d_cond: 32
+  pred_depth: 6
+  pred_heads: 8
+  pred_mlp_ratio: 2.0
+
+  # Decoder: maps latent back to [8, 8, 32] grid
+  use_decoder: true
+  d_dec: 256
+  dec_depth: 4
+  dec_heads: 4
+  dec_mlp_ratio: 4.0
+
+  # General
+  dropout: 0.0
+  num_projections: 512
+  lambda_sigreg: 0.5
+
+  # Reconstruction
+  lambda_recon: 1.0
+
+  # Return distribution supervision
+  lambda_price: 5.0        # Student-t NLL weight
+  lambda_returns: 2.0      # whiteness penalty weight
+  beta_leverage: 0.5       # asymmetric volatility

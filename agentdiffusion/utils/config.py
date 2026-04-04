@@ -75,6 +75,9 @@ class DataConfig:
     data_dir: str = "data/abides_small"
     num_workers: int = 4
     pin_memory: bool = True
+    # Crypto-specific fields (ignored by ABIDES pipeline)
+    symbol: str = "BTCUSDT"
+    stride: int = 1
 
 
 @dataclass
