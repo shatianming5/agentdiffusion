@@ -26,8 +26,17 @@ class DDPMTrainer:
         z0: torch.Tensor,                          # [B, H, W, d_agent]  clean latent
         market_cond: torch.Tensor | None = None,
         scenario: torch.Tensor | None = None,
+        return_price: bool = False,
     ) -> dict[str, torch.Tensor]:
-        """Single training step: sample t, add noise, predict, compute loss."""
+        """Single training step: sample t, add noise, predict, compute loss.
+
+        Args:
+            z0: Clean latent [B, H, W, latent_dim].
+            market_cond: Market condition [B, market_cond_dim].
+            scenario: Scenario index [B].
+            return_price: If True, also compute auxiliary price prediction
+                from the model's price head (requires model to support it).
+        """
         B = z0.shape[0]
         device = z0.device
 
@@ -40,8 +49,12 @@ class DDPMTrainer:
         # Forward diffusion
         z_t = self.scheduler.q_sample(z0, t, noise)
 
-        # Model prediction
-        pred = self.model(z_t, t, market_cond, scenario)
+        # Model prediction (optionally with price head)
+        price_pred = None
+        if return_price:
+            pred, price_pred = self.model(z_t, t, market_cond, scenario, return_price=True)
+        else:
+            pred = self.model(z_t, t, market_cond, scenario)
 
         # Compute target and loss
         if self.prediction_type == "v_prediction":
@@ -55,7 +68,7 @@ class DDPMTrainer:
 
         loss = nn.functional.mse_loss(pred, target)
 
-        return {
+        result = {
             "loss": loss,
             "pred": pred,
             "target": target,
@@ -63,3 +76,6 @@ class DDPMTrainer:
             "t": t,
             "noise": noise,
         }
+        if price_pred is not None:
+            result["price_pred"] = price_pred
+        return result

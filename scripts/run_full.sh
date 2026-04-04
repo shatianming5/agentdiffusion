@@ -116,7 +116,12 @@ for _ in range(200):
     states.append(s)
 
 traj = torch.stack(states, dim=0)
-prices = traj[:, 0, :, :, 98].mean(dim=(1,2)).cpu().numpy()  # dim 98 = mid price
+# Use masked mean to exclude padding agents (padding has all-zero features)
+# traj shape: [T+1, B, H, W, C]
+agent_mask = (traj[:, 0, :, :, 0] != 0) | (traj[:, 0, :, :, 1] != 0)  # [T+1, H, W]
+raw_prices = traj[:, 0, :, :, 98]  # [T+1, H, W] — dim 98 = mid price
+masked_prices = raw_prices * agent_mask.float()
+prices = (masked_prices.sum(dim=(1,2)) / agent_mask.float().sum(dim=(1,2)).clamp(min=1)).cpu().numpy()
 prices = np.clip(prices, 0.01, None)
 
 from agentdiffusion.eval.stylized_facts import evaluate_stylized_facts

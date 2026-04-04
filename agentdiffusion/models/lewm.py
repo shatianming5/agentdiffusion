@@ -26,12 +26,7 @@ import torch.nn.functional as F
 from .lewm_encoder import LeWMEncoder
 from .lewm_predictor import LeWMPredictor
 from .lewm_decoder import LeWMDecoder
-
-
-def masked_mean(tensor: torch.Tensor, mask: torch.Tensor, dims: tuple[int, ...]) -> torch.Tensor:
-    """Average tensor over dims, only counting positions where mask is True."""
-    tensor = tensor * mask.float()
-    return tensor.sum(dim=dims) / mask.float().sum(dim=dims).clamp(min=1)
+from ..utils.masked import masked_mean
 
 
 @dataclass

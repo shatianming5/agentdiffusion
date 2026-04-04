@@ -1,4 +1,13 @@
-"""Stage 2: Diffusion model training with constraint losses."""
+"""Stage 2: Diffusion model training with constraint losses and price dynamics.
+
+Adds auxiliary price/return supervision on top of the primary diffusion loss,
+mirroring the price dynamics fixes from the LeWorldModel pipeline:
+  - Masked price extraction (exclude padding agents)
+  - Price MSE loss (weight 5.0)
+  - Log-return Huber loss (weight 2.0)
+These losses flow through the model's auxiliary price_head, providing
+a differentiable gradient path without requiring backprop through the frozen AE.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +17,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -18,6 +28,7 @@ from ..diffusion.ddpm import DDPMTrainer
 from ..constraints.soft_loss import ConstraintLoss
 from ..data.dataset import AgentTransitionDataset, SyntheticAgentDataset
 from ..utils.config import load_config
+from ..utils.masked import masked_mean
 
 
 class EMA:
@@ -126,6 +137,10 @@ class DiffusionTrainer:
         loader = self.build_dataloader()
         pbar = tqdm(total=self.cfg.train.total_steps, desc="Diffusion Training")
 
+        # Auxiliary loss weights for price dynamics supervision
+        w_price = 5.0
+        w_return = 2.0
+
         while self.global_step < self.cfg.train.total_steps:
             for batch in loader:
                 if self.global_step >= self.cfg.train.total_steps:
@@ -140,12 +155,11 @@ class DiffusionTrainer:
                 with torch.no_grad():
                     z0 = self.ae.encode(state_t1)  # target: next state latent
 
-                # Diffusion loss
-                ddpm_out = self.ddpm.compute_loss(z0, market_cond)
+                # Diffusion loss (with price head for auxiliary supervision)
+                ddpm_out = self.ddpm.compute_loss(z0, market_cond, return_price=True)
                 diff_loss = ddpm_out["loss"]
 
-                # Constraint loss (on decoded prediction)
-                # Approximate: decode the predicted x0 from v-prediction
+                # Constraint loss (on decoded prediction, detached — no grad through AE)
                 with torch.no_grad():
                     if self.cfg.diffusion.prediction_type == "v_prediction":
                         z0_pred = self.scheduler.predict_x0_from_v(
@@ -157,8 +171,33 @@ class DiffusionTrainer:
 
                 constraint_out = self.constraint_loss(state_t, state_pred)
 
-                # Total loss
-                loss = diff_loss + constraint_out["constraint_total"]
+                # --- Price dynamics auxiliary losses ---
+                # Extract ground-truth prices with masked mean (exclude padding agents).
+                # Padding agents have all-zero features; mask = any non-zero in first two dims.
+                mask = (state_t[..., 0] != 0) | (state_t[..., 1] != 0)  # [B, H, W]
+                price_t_gt = masked_mean(state_t[..., 98], mask, dims=(1, 2))    # [B]
+                price_t1_gt = masked_mean(state_t1[..., 98], mask, dims=(1, 2))  # [B]
+
+                # Price prediction from the model's auxiliary head (differentiable)
+                price_pred = ddpm_out["price_pred"]  # [B]
+
+                # Price MSE: encourage the model to predict the correct next-step price
+                loss_price = F.mse_loss(price_pred, price_t1_gt) * w_price
+
+                # Log-return Huber: encourage correct return dynamics
+                log_price_t = torch.log(price_t_gt.clamp(min=0.01))
+                log_price_t1 = torch.log(price_t1_gt.clamp(min=0.01))
+                log_price_pred = torch.log(price_pred.clamp(min=0.01))
+                loss_return = F.huber_loss(
+                    log_price_pred - log_price_t,
+                    log_price_t1 - log_price_t,
+                ) * w_return
+
+                # Total loss: diffusion (primary) + constraints + price dynamics (auxiliary)
+                loss = (diff_loss
+                        + constraint_out["constraint_total"]
+                        + loss_price
+                        + loss_return)
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -174,6 +213,8 @@ class DiffusionTrainer:
                     pbar.set_postfix(
                         loss=f"{loss.item():.4f}",
                         diff=f"{diff_loss.item():.4f}",
+                        price=f"{loss_price.item():.4f}",
+                        ret=f"{loss_return.item():.4f}",
                         clear=f"{constraint_out['clearing_loss'].item():.4f}",
                     )
 

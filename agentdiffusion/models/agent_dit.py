@@ -22,6 +22,11 @@ class AgentDiT(nn.Module):
          -> FinalLayer
          -> Unpatchify [H,W,d_agent]
          -> Per-agent decode [H,W,128]
+
+    Auxiliary price prediction head branches off the final hidden states
+    (before unpatchify) to predict market price dynamics. This provides
+    a differentiable supervision signal for price/return accuracy without
+    requiring gradients through the frozen AE decoder.
     """
 
     def __init__(
@@ -69,6 +74,15 @@ class AgentDiT(nn.Module):
         # Unpatchify
         self.unpatchify = Unpatchify(patch_size, latent_dim, d_model)
 
+        # --- Price prediction head (auxiliary) ---
+        # Global average pool over patch tokens -> MLP -> scalar price prediction.
+        # Provides a differentiable path for price/return supervision.
+        self.price_head = nn.Sequential(
+            nn.Linear(d_model, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
+        )
+
         self._init_weights()
 
     def _init_weights(self):
@@ -85,10 +99,20 @@ class AgentDiT(nn.Module):
         t: torch.Tensor,                           # [B]  diffusion timestep
         market_cond: torch.Tensor | None = None,   # [B, market_cond_dim]
         scenario: torch.Tensor | None = None,      # [B]  int
-    ) -> torch.Tensor:
+        return_price: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Predict v (or noise/x0) given noisy latent + conditions.
 
-        Returns: [B, H, W, latent_dim]
+        Args:
+            z_noisy: Noised latent grid [B, H, W, latent_dim].
+            t: Diffusion timestep [B].
+            market_cond: Market condition vector [B, market_cond_dim].
+            scenario: Scenario index [B] int.
+            return_price: If True, also return price prediction from auxiliary head.
+
+        Returns:
+            If return_price is False: [B, H, W, latent_dim] predicted v/noise/x0.
+            If return_price is True: (v_pred, price_pred) where price_pred is [B].
         """
         B, H, W, _ = z_noisy.shape
         p = self.patch_size
@@ -104,6 +128,13 @@ class AgentDiT(nn.Module):
         for block in self.blocks:
             x = block(x, c, Hp, Wp)
 
+        # Branch: auxiliary price prediction from hidden states
+        price_pred = None
+        if return_price:
+            # Global average pool over patch tokens -> price scalar
+            pooled = x.mean(dim=1)  # [B, d_model]
+            price_pred = self.price_head(pooled).squeeze(-1)  # [B]
+
         # Final layer + unpatchify
         x = self.final_layer(x, c)  # [B, Hp*Wp, p*p*latent_dim]
 
@@ -112,6 +143,8 @@ class AgentDiT(nn.Module):
         x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
         x = x.view(B, H, W, self.latent_dim)
 
+        if return_price:
+            return x, price_pred
         return x
 
 
