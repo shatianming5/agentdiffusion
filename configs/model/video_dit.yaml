@@ -1,0 +1,27 @@
+agent:
+  raw_dim: 128
+  latent_dim: 16
+  agent_types: 4
+
+patch:
+  patch_size: 4
+  grid_h: 36
+  grid_w: 36
+
+model:
+  d_model: 512
+  depth: 12
+  heads: 8
+  mlp_ratio: 4.0
+  market_cond_dim: 32
+  dropout: 0.0
+
+video:
+  num_frames: 40
+  num_cond_frames: 8
+
+diffusion:
+  timesteps: 1000
+  beta_schedule: cosine
+  prediction_type: v_prediction
+  ddim_steps: 50

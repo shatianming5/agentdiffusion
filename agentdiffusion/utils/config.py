@@ -32,6 +32,7 @@ class ModelConfig:
     mlp_ratio: float = 4.0
     num_market_tokens: int = 128
     local_window_size: int = 8
+    market_cond_dim: int = 32
     dropout: float = 0.0
 
 
@@ -81,6 +82,14 @@ class DataConfig:
 
 
 @dataclass
+class VideoConfig:
+    """Video DiT sequence configuration."""
+    num_frames: int = 40          # Total frames per sequence (K + N)
+    num_cond_frames: int = 8      # K condition frames (clean)
+    # num_gen_frames = num_frames - num_cond_frames = 32
+
+
+@dataclass
 class LeWMConfig:
     """LeWorldModel (JEPA) architecture configuration."""
     d_enc: int = 256
@@ -117,6 +126,7 @@ class AgentDiffusionConfig:
     constraint: ConstraintConfig = field(default_factory=ConstraintConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    video: VideoConfig = field(default_factory=VideoConfig)
     lewm: LeWMConfig = field(default_factory=LeWMConfig)
     seed: int = 42
     output_dir: str = "outputs"
