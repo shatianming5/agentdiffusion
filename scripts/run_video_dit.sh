@@ -9,7 +9,7 @@ DATA_DIR="${DATA_DIR:-data/abides_video}"
 AE_CKPT="${AE_CKPT:-outputs/ae_norm/ae_step_10000.pt}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/video_dit}"
 NUM_SIMS="${NUM_SIMS:-200}"
-TRAIN_STEPS="${TRAIN_STEPS:-50000}"
+TRAIN_STEPS="${TRAIN_STEPS:-20000}"
 
 echo "============================================================"
 echo "  Video DiT Pipeline"
@@ -78,11 +78,11 @@ ${PYTHON} -m agentdiffusion.train.train_video_dit \
     data.data_dir="${DATA_DIR}" \
     patch.grid_h=36 patch.grid_w=36 \
     patch.patch_size=4 \
-    model.d_model=512 model.depth=12 model.heads=8 \
+    model.d_model=256 model.depth=6 model.heads=4 \
     agent.latent_dim=16 \
     video.num_frames=40 video.num_cond_frames=8 \
     diffusion.timesteps=1000 \
-    train.total_steps="${TRAIN_STEPS}" train.batch_size=4 \
+    train.total_steps="${TRAIN_STEPS}" train.batch_size=8 \
     train.log_every=100 train.save_every=10000 \
     data.num_workers=0 data.pin_memory=false \
     output_dir="${OUTPUT_DIR}"
@@ -123,7 +123,7 @@ ae.eval()
 
 # Load Video DiT
 model = VideoDiT(
-    d_latent=16, d_model=512, depth=12, heads=8,
+    d_latent=16, d_model=256, depth=6, heads=4,
     patch_size=4, grid_h=36, grid_w=36,
     num_frames=40, num_cond_frames=8,
 ).to(device)
