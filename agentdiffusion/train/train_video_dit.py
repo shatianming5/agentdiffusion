@@ -16,12 +16,16 @@ from __future__ import annotations
 import argparse
 import copy
 import logging
+import os
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from ..models.video_dit import build_video_dit, VideoDiT
@@ -31,6 +35,40 @@ from ..data.video_dataset import AgentVideoDataset, SyntheticVideoDataset
 from ..utils.config import load_config
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Distributed helpers
+# ---------------------------------------------------------------------------
+
+def is_distributed() -> bool:
+    """Return True if running inside a distributed (torchrun) process group."""
+    return dist.is_initialized()
+
+
+def is_main_process() -> bool:
+    """Return True on rank-0 (or when not using distributed at all)."""
+    return not is_distributed() or dist.get_rank() == 0
+
+
+def setup_distributed():
+    """Initialise the NCCL process group when launched via torchrun.
+
+    torchrun sets RANK, WORLD_SIZE, LOCAL_RANK and MASTER_* env vars
+    automatically.  If those are absent we silently skip so that
+    single-GPU ``python -m ...`` still works unchanged.
+    """
+    if "RANK" not in os.environ:
+        return  # not launched with torchrun – single-GPU mode
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+
+
+def cleanup_distributed():
+    """Destroy the process group if one exists."""
+    if is_distributed():
+        dist.destroy_process_group()
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +120,14 @@ class VideoDiTTrainer:
 
     def __init__(self, cfg):
         self.cfg = cfg
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # --- Distributed setup ---
+        self._distributed = is_distributed()
+        if self._distributed:
+            self.local_rank = int(os.environ["LOCAL_RANK"])
+            self.device = torch.device(f"cuda:{self.local_rank}")
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # --- Frozen autoencoder (from Stage 1) ---
         self.ae = AgentAutoencoder(
@@ -95,6 +140,8 @@ class VideoDiTTrainer:
 
         # --- Video DiT model ---
         self.model = build_video_dit(cfg).to(self.device)
+        if self._distributed:
+            self.model = DDP(self.model, device_ids=[self.local_rank])
 
         # --- Noise scheduler (cosine) ---
         self.scheduler = NoiseScheduler(
@@ -114,12 +161,13 @@ class VideoDiTTrainer:
             total_steps=cfg.train.total_steps,
         )
 
-        # --- EMA ---
-        self.ema = EMA(self.model, cfg.train.ema_decay)
+        # --- EMA (always track the unwrapped model) ---
+        self.ema = EMA(self._unwrapped_model, cfg.train.ema_decay)
 
         self.global_step = 0
         self.output_dir = Path(cfg.output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        if is_main_process():
+            self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Video-specific params
         self.num_cond_frames = cfg.video.num_cond_frames
@@ -132,6 +180,11 @@ class VideoDiTTrainer:
         )
         self.scaler = torch.amp.GradScaler("cuda", enabled=(self.use_amp and self.amp_dtype == torch.float16))
 
+    # --- Helper: unwrapped model (strips DDP wrapper if present) ---
+    @property
+    def _unwrapped_model(self) -> nn.Module:
+        return self.model.module if self._distributed else self.model
+
     def load_ae_checkpoint(self, path: str):
         """Load pretrained autoencoder weights."""
         ckpt = torch.load(path, map_location=self.device, weights_only=True)
@@ -139,17 +192,25 @@ class VideoDiTTrainer:
         logger.info("Loaded AE from %s", path)
 
     def load_checkpoint(self, path: str):
-        """Resume from a Video DiT checkpoint."""
+        """Resume from a Video DiT checkpoint.
+
+        Checkpoints always store the *unwrapped* model state_dict so they
+        are compatible with both single-GPU and DDP runs.
+        """
         ckpt = torch.load(path, map_location=self.device, weights_only=True)
-        self.model.load_state_dict(ckpt["model"])
+        self._unwrapped_model.load_state_dict(ckpt["model"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
         self.global_step = ckpt.get("step", 0)
         if "ema" in ckpt:
             self.ema.shadow.load_state_dict(ckpt["ema"])
         logger.info("Resumed Video DiT from %s (step %d)", path, self.global_step)
 
-    def build_dataloader(self) -> DataLoader:
-        """Build the training DataLoader."""
+    def build_dataloader(self) -> tuple[DataLoader, DistributedSampler | None]:
+        """Build the training DataLoader.
+
+        Returns (loader, sampler).  ``sampler`` is non-None only in DDP mode
+        so the caller can call ``sampler.set_epoch(epoch)`` each epoch.
+        """
         p = self.cfg.patch.patch_size
         pad_h = ((self.cfg.patch.grid_h + p - 1) // p) * p
         pad_w = ((self.cfg.patch.grid_w + p - 1) // p) * p
@@ -165,9 +226,11 @@ class VideoDiTTrainer:
                 pad_to=(pad_h, pad_w),
                 market_cond_dim=getattr(self.cfg.model, "market_cond_dim", 32),
             )
-            logger.info("Loaded %d video sequences from %s", len(dataset), self.cfg.data.data_dir)
+            if is_main_process():
+                logger.info("Loaded %d video sequences from %s", len(dataset), self.cfg.data.data_dir)
         except (FileNotFoundError, ValueError) as e:
-            logger.warning("Real data not available (%s), using synthetic data", e)
+            if is_main_process():
+                logger.warning("Real data not available (%s), using synthetic data", e)
             dataset = SyntheticVideoDataset(
                 num_samples=500,
                 total_frames=total_frames,
@@ -178,14 +241,23 @@ class VideoDiTTrainer:
                 market_cond_dim=getattr(self.cfg.model, "market_cond_dim", 32),
             )
 
-        return DataLoader(
+        # In distributed mode use DistributedSampler (disables shuffle in DataLoader)
+        sampler = None
+        shuffle = True
+        if self._distributed:
+            sampler = DistributedSampler(dataset, shuffle=True)
+            shuffle = False  # sampler handles shuffling
+
+        loader = DataLoader(
             dataset,
             batch_size=self.cfg.train.batch_size,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=sampler,
             num_workers=self.cfg.data.num_workers,
             pin_memory=self.cfg.data.pin_memory,
             drop_last=True,
         )
+        return loader, sampler
 
     def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
         """Single training step.
@@ -248,7 +320,7 @@ class VideoDiTTrainer:
             self.optimizer.step()
 
         self.lr_scheduler.step()
-        self.ema.update(self.model)
+        self.ema.update(self._unwrapped_model)
 
         return {
             "loss": loss.item(),
@@ -257,43 +329,65 @@ class VideoDiTTrainer:
 
     def train(self):
         """Full training loop."""
-        loader = self.build_dataloader()
-        pbar = tqdm(
-            total=self.cfg.train.total_steps - self.global_step,
-            desc="Video DiT Training",
-            initial=0,
-        )
+        loader, sampler = self.build_dataloader()
 
+        # Only show progress bar on rank 0
+        pbar = None
+        if is_main_process():
+            pbar = tqdm(
+                total=self.cfg.train.total_steps - self.global_step,
+                desc="Video DiT Training",
+                initial=0,
+            )
+
+        epoch = 0
         while self.global_step < self.cfg.train.total_steps:
+            # Ensure proper shuffling per epoch in DDP mode
+            if sampler is not None:
+                sampler.set_epoch(epoch)
+            epoch += 1
+
             for batch in loader:
                 if self.global_step >= self.cfg.train.total_steps:
                     break
 
                 metrics = self.train_step(batch)
                 self.global_step += 1
-                pbar.update(1)
+                if pbar is not None:
+                    pbar.update(1)
 
-                # Logging
-                if self.global_step % self.cfg.train.log_every == 0:
-                    pbar.set_postfix(
-                        step=self.global_step,
-                        loss=f"{metrics['loss']:.4f}",
-                        lr=f"{metrics['lr']:.2e}",
-                    )
+                # Logging (rank 0 only)
+                if is_main_process() and self.global_step % self.cfg.train.log_every == 0:
+                    if pbar is not None:
+                        pbar.set_postfix(
+                            step=self.global_step,
+                            loss=f"{metrics['loss']:.4f}",
+                            lr=f"{metrics['lr']:.2e}",
+                        )
 
-                # Checkpointing
-                if self.global_step % self.cfg.train.save_every == 0:
+                # Checkpointing (rank 0 only)
+                if is_main_process() and self.global_step % self.cfg.train.save_every == 0:
                     self.save_checkpoint()
 
-        pbar.close()
-        self.save_checkpoint()
-        logger.info("Training complete. Final step: %d", self.global_step)
+                # Synchronise after checkpoint so all ranks wait
+                if self._distributed and self.global_step % self.cfg.train.save_every == 0:
+                    dist.barrier()
+
+        if pbar is not None:
+            pbar.close()
+        if is_main_process():
+            self.save_checkpoint()
+            logger.info("Training complete. Final step: %d", self.global_step)
 
     def save_checkpoint(self):
-        """Save model, EMA, optimizer, and step."""
+        """Save model, EMA, optimizer, and step.
+
+        Always saves the *unwrapped* model state_dict so checkpoints are
+        portable between single-GPU and multi-GPU runs.
+        """
         path = self.output_dir / f"video_dit_step_{self.global_step}.pt"
         torch.save({
-            "model": self.model.state_dict(),
+            "model": self._unwrapped_model.state_dict(),
             "ema": self.ema.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "step": self.global_step,
@@ -324,7 +418,12 @@ def main():
                         help="OmegaConf overrides (e.g. train.lr=1e-4)")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
+    # --- Distributed init (no-op when launched without torchrun) ---
+    setup_distributed()
+
+    # Only log on rank 0 to avoid duplicated messages
+    log_level = logging.INFO if is_main_process() else logging.WARNING
+    logging.basicConfig(level=log_level, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 
     cfg = load_config(args.config, args.overrides)
 
@@ -334,7 +433,10 @@ def main():
     if args.resume:
         trainer.load_checkpoint(args.resume)
 
-    trainer.train()
+    try:
+        trainer.train()
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
