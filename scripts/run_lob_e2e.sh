@@ -141,7 +141,7 @@ echo "Using Video DiT: ${VDIT_CKPT}"
 # Get d_latent from LOBVideoDataset
 D_LATENT=$(.venv/bin/python3 -c "
 from agentdiffusion.data.lob_dataset import LOBVideoDataset
-d = LOBVideoDataset('${OB_PATH}','${MSG_PATH}',total_frames=20,cond_frames=4,subsample=10,grid_shape=(16,16))
+d = LOBVideoDataset('${OB_PATH}','${MSG_PATH}',total_frames=20,cond_frames=4,subsample=10,grid_shape=(${GRID_H},${GRID_W}))
 print(d[0]['frames'].shape[-1])
 ")
 echo "d_latent from LOB: ${D_LATENT}"
@@ -151,7 +151,7 @@ echo "d_latent from LOB: ${D_LATENT}"
     --ob-path "${OB_PATH}" \
     --msg-path "${MSG_PATH}" \
     --grid-h ${GRID_H} --grid-w ${GRID_W} \
-    --d-state ${D_LATENT} --d-embed 128 --d-model 128 \
+    --d-state ${D_LATENT} --d-embed 128 --d-model 128 --patch-size 2 \
     --total-steps 3000 --batch-size 8 --lr 3e-4 \
     --output-dir "${OA_OUT}"
 
