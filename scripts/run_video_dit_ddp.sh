@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 export PYTHONPATH=$PWD:${PYTHONPATH:-}
 export CUDA_VISIBLE_DEVICES=0,3
 
-torchrun --nproc_per_node=2 -m agentdiffusion.train.train_video_dit \
+.venv/bin/torchrun --nproc_per_node=2 -m agentdiffusion.train.train_video_dit \
     --config configs/train/stage_video_dit.yaml \
     --ae-ckpt outputs/ae_norm/ae_step_10000.pt \
     data.data_dir=data/abides_video \
