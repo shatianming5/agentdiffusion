@@ -255,6 +255,7 @@ def main():
     parser.add_argument("--grid-w", type=int, default=16)
     parser.add_argument("--d-state", type=int, default=16)
     parser.add_argument("--d-embed", type=int, default=128)
+    parser.add_argument("--d-model", type=int, default=128, help="Video DiT d_model")
     parser.add_argument("--total-steps", type=int, default=5000)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -266,6 +267,7 @@ def main():
     trainer = OrderAgentTrainer(
         vdit_ckpt=args.vdit_ckpt,
         ob_path=args.ob_path,
+        d_model=args.d_model,
         msg_path=args.msg_path,
         grid_h=args.grid_h,
         grid_w=args.grid_w,

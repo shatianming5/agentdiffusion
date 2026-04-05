@@ -152,7 +152,7 @@ echo "d_latent from LOB: ${D_LATENT}"
     --ob-path "${OB_PATH}" \
     --msg-path "${MSG_PATH}" \
     --grid-h ${GRID_H} --grid-w ${GRID_W} \
-    --d-state ${D_LATENT} --d-embed 128 \
+    --d-state ${D_LATENT} --d-embed 128 --d-model 128 \
     --total-steps 3000 --batch-size 8 --lr 3e-4 \
     --output-dir "${OA_OUT}"
 
