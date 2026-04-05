@@ -118,8 +118,9 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_steps: int, total_steps: i
 class VideoDiTTrainer:
     """Full training loop for the Video DiT model."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, no_ae: bool = False):
         self.cfg = cfg
+        self.no_ae = no_ae
 
         # --- Distributed setup ---
         self._distributed = is_distributed()
@@ -130,13 +131,16 @@ class VideoDiTTrainer:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # --- Frozen autoencoder (from Stage 1) ---
-        self.ae = AgentAutoencoder(
-            raw_dim=cfg.agent.raw_dim,
-            latent_dim=cfg.agent.latent_dim,
-        ).to(self.device)
-        self.ae.eval()
-        for p in self.ae.parameters():
-            p.requires_grad_(False)
+        if not self.no_ae:
+            self.ae = AgentAutoencoder(
+                raw_dim=cfg.agent.raw_dim,
+                latent_dim=cfg.agent.latent_dim,
+            ).to(self.device)
+            self.ae.eval()
+            for p in self.ae.parameters():
+                p.requires_grad_(False)
+        else:
+            self.ae = None
 
         # --- Video DiT model ---
         self.model = build_video_dit(cfg).to(self.device)
@@ -271,11 +275,14 @@ class VideoDiTTrainer:
         K = self.num_cond_frames
         N = self.num_gen_frames
 
-        # --- Encode all frames through frozen AE ---
-        with torch.no_grad():
-            flat_frames = frames.reshape(B * T, H, W, C_raw)
-            latents = self.ae.encode(flat_frames)             # [B*T, H, W, d_latent]
-            latents = latents.reshape(B, T, H, W, -1)        # [B, T, H, W, d_latent]
+        # --- Encode all frames through frozen AE (or use raw directly) ---
+        if self.no_ae:
+            latents = frames  # [B, T, H, W, C_raw] used directly as latents
+        else:
+            with torch.no_grad():
+                flat_frames = frames.reshape(B * T, H, W, C_raw)
+                latents = self.ae.encode(flat_frames)             # [B*T, H, W, d_latent]
+                latents = latents.reshape(B, T, H, W, -1)        # [B, T, H, W, d_latent]
 
         # Split condition and generation frames
         z_cond = latents[:, :K]      # [B, K, H, W, d_latent] -- clean
@@ -304,7 +311,40 @@ class VideoDiTTrainer:
             v_target = v_target_flat.reshape(B, N, H, W, d_latent)
 
             # MSE loss on generation frames only
-            loss = F.mse_loss(v_pred, v_target)
+            loss_diffusion = F.mse_loss(v_pred, v_target)
+
+            # --- Constraint losses (P0): zero-sum clearing + budget ---
+            loss_clearing = torch.tensor(0.0, device=self.device)
+            loss_budget = torch.tensor(0.0, device=self.device)
+            lam_c = self.cfg.constraint.lambda_clearing
+            lam_b = self.cfg.constraint.lambda_budget
+            if lam_c > 0 or lam_b > 0:
+                # Recover x0 prediction from v-prediction
+                v_pred_flat = v_pred.reshape(B * N, H, W, d_latent)
+                z0_pred_flat = self.scheduler.predict_x0_from_v(
+                    z_noisy_flat, t_expanded, v_pred_flat
+                )
+                z0_pred = z0_pred_flat.reshape(B, N, H, W, d_latent)
+
+                # Decode to raw space if using AE (grad flows through frozen AE forward)
+                if self.no_ae:
+                    raw_pred = z0_pred
+                else:
+                    raw_flat = self.ae.decode(z0_pred_flat)
+                    raw_pred = raw_flat.reshape(B, N, H, W, -1)
+
+                # 1) Zero-sum clearing: mean position change per agent per frame ≈ 0
+                if lam_c > 0 and raw_pred.shape[1] > 1:
+                    delta_pos = raw_pred[:, 1:, :, :, 0] - raw_pred[:, :-1, :, :, 0]
+                    n_cells = float(H * W)
+                    mean_delta = delta_pos.sum(dim=(-2, -1)) / n_cells  # [B, N-1]
+                    loss_clearing = mean_delta.pow(2).mean()
+
+                # 2) Budget: cash (dim 1) should not go very negative
+                if lam_b > 0:
+                    loss_budget = F.relu(-raw_pred[:, :, :, :, 1]).mean()
+
+            loss = loss_diffusion + lam_c * loss_clearing + lam_b * loss_budget
 
         # --- Backward ---
         self.optimizer.zero_grad()
@@ -324,6 +364,9 @@ class VideoDiTTrainer:
 
         return {
             "loss": loss.item(),
+            "loss_diff": loss_diffusion.item(),
+            "loss_clear": loss_clearing.item(),
+            "loss_budg": loss_budget.item(),
             "lr": self.optimizer.param_groups[0]["lr"],
         }
 
@@ -362,6 +405,8 @@ class VideoDiTTrainer:
                         pbar.set_postfix(
                             step=self.global_step,
                             loss=f"{metrics['loss']:.4f}",
+                            clr=f"{metrics['loss_clear']:.4f}",
+                            bdg=f"{metrics['loss_budg']:.4f}",
                             lr=f"{metrics['lr']:.2e}",
                         )
 
@@ -412,6 +457,8 @@ def main():
                         help="Path to YAML config file")
     parser.add_argument("--ae-ckpt", type=str, default=None,
                         help="Path to pretrained AE checkpoint")
+    parser.add_argument("--no-ae", action="store_true",
+                        help="Skip AE, use raw data directly (d_latent=raw_dim)")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to Video DiT checkpoint to resume from")
     parser.add_argument("overrides", nargs="*",
@@ -427,8 +474,8 @@ def main():
 
     cfg = load_config(args.config, args.overrides)
 
-    trainer = VideoDiTTrainer(cfg)
-    if args.ae_ckpt:
+    trainer = VideoDiTTrainer(cfg, no_ae=args.no_ae)
+    if args.ae_ckpt and not args.no_ae:
         trainer.load_ae_checkpoint(args.ae_ckpt)
     if args.resume:
         trainer.load_checkpoint(args.resume)

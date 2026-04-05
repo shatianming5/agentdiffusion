@@ -479,6 +479,8 @@ class VideoDDIMSampler:
         gen_shape: tuple[int, ...],
         market_cond: torch.Tensor | None = None,
         device: torch.device | None = None,
+        zero_sum_proj: bool = False,
+        valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run DDIM denoising on generation frames while keeping condition frames clean.
 
@@ -487,6 +489,9 @@ class VideoDDIMSampler:
             gen_shape: (B, N, H, W, d_latent)  -- shape of generation frames.
             market_cond: [B, market_cond_dim]   -- optional market conditions.
             device: target device.
+            zero_sum_proj: if True, project position (dim 0) changes to zero-sum
+                           after each denoising step.
+            valid_mask: [H, W] bool mask of valid agents (for zero-sum projection).
 
         Returns:
             [B, N, H, W, d_latent] -- denoised generation frames.
@@ -556,6 +561,21 @@ class VideoDDIMSampler:
             )
             if self.eta > 0:
                 x_gen = x_gen + sigma * torch.randn_like(x_gen)
+
+            # --- Zero-sum projection on position (dim 0) ---
+            if zero_sum_proj:
+                # x_gen: [B, N, H, W, d_latent], dim 0 of last axis = position
+                pos = x_gen[:, :, :, :, 0]  # [B, N, H, W]
+                if valid_mask is not None:
+                    # Mean correction over valid agents only
+                    vm = valid_mask.to(pos.device)  # [H, W]
+                    n_valid = vm.sum().float().clamp(min=1)
+                    net = (pos * vm).sum(dim=(-2, -1), keepdim=True) / n_valid
+                    x_gen[:, :, :, :, 0] = pos - net * vm
+                else:
+                    H, W = pos.shape[-2], pos.shape[-1]
+                    net = pos.mean(dim=(-2, -1), keepdim=True)
+                    x_gen[:, :, :, :, 0] = pos - net
 
         return x_gen
 
