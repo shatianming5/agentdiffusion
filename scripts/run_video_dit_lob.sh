@@ -49,6 +49,7 @@ model = VideoDiT(
     d_latent=1, d_model=128, depth=6, heads=4,
     patch_size=2, num_frames=20, num_cond_frames=4,
     mlp_ratio=4.0, market_cond_dim=32,
+    grid_h=6, grid_w=8,
 ).to(device)
 logger.info(f"Params: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
