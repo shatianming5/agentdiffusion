@@ -75,9 +75,19 @@ class AgentVideoDataset(Dataset):
         # (each file provides state_t -> state_t1, so consecutive files chain).
         num_transitions = total_frames - 1
 
+        # Pre-load all data into memory for fast access
+        # (9800 files × ~1MB = ~10GB, fits in RAM)
+        self._file_cache: dict[str, dict] = {}
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"Pre-loading {len(all_files)} files into memory...")
+        for f in all_files:
+            self._file_cache[str(f)] = torch.load(f, map_location="cpu", weights_only=True)
+
+        # Group files by sim_id using cached data
         sim_groups: dict[int, list[tuple[int, Path]]] = {}
         for f in all_files:
-            data = torch.load(f, map_location="cpu", weights_only=True)
+            data = self._file_cache[str(f)]
             sid = int(data.get("sim_id", 0))
             tidx = int(data.get("time_index", 0))
             sim_groups.setdefault(sid, []).append((tidx, f))
@@ -116,7 +126,7 @@ class AgentVideoDataset(Dataset):
         market_conds: list[torch.Tensor] = []
 
         for i, fpath in enumerate(window):
-            data = torch.load(fpath, map_location="cpu", weights_only=True)
+            data = self._file_cache[str(fpath)]
             st = data["state_t"]
             st1 = data["state_t1"]
             mc = data.get("market_cond", torch.zeros(self.market_cond_dim))
