@@ -13,11 +13,11 @@ echo "============================================================"
 
 OB_PATH="data/external/lobster/AMZN_2012-06-21_34200000_57600000_orderbook_10.csv"
 MSG_PATH="data/external/lobster/AMZN_2012-06-21_34200000_57600000_message_10.csv"
-GRID_H=16
-GRID_W=16
-D_STATE=16
-VDIT_OUT="outputs/vdit_lob_16x16"
-OA_OUT="outputs/order_agent_lob"
+GRID_H=4
+GRID_W=4
+D_STATE=3
+VDIT_OUT="outputs/vdit_lob_4x4"
+OA_OUT="outputs/order_agent_lob_v2"
 
 # ============================================================
 # Stage A: Train small Video DiT on LOB data (16x16 grid)
@@ -36,34 +36,33 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 logger = logging.getLogger(__name__)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-OUT_DIR = Path("outputs/vdit_lob_16x16")
+OUT_DIR = Path("outputs/vdit_lob_4x4")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Dataset: LOB snapshots as video frames ---
 OB = "data/external/lobster/AMZN_2012-06-21_34200000_57600000_orderbook_10.csv"
 MSG = "data/external/lobster/AMZN_2012-06-21_34200000_57600000_message_10.csv"
 
-dataset = LOBVideoDataset(OB, MSG, total_frames=20, cond_frames=4, subsample=10, grid_shape=(16, 16))
+dataset = LOBVideoDataset(OB, MSG, total_frames=20, cond_frames=4, subsample=10, grid_shape=(4, 4))
 logger.info(f"Dataset: {len(dataset)} sequences")
 loader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True, num_workers=0, drop_last=True)
 
-# --- Model: small Video DiT for 16x16 grid ---
-# d_latent = feature dim from LOBVideoDataset (1 per cell)
+# --- Model: Video DiT for 4x4 grid with d_latent=3 (48 LOB features / 16 cells) ---
 sample = dataset[0]
 d_latent = sample["frames"].shape[-1]
-logger.info(f"d_latent={d_latent}, grid={16}x{16}")
+logger.info(f"d_latent={d_latent}, grid=4x4")
 
 model = VideoDiT(
     d_latent=d_latent, d_model=128, depth=6, heads=4,
-    patch_size=4, num_frames=20, num_cond_frames=4,
+    patch_size=2, num_frames=20, num_cond_frames=4,
     mlp_ratio=4.0, market_cond_dim=32,
-    grid_h=16, grid_w=16,
+    grid_h=4, grid_w=4,
 ).to(device)
 logger.info(f"Params: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
 scheduler = NoiseScheduler(1000, "cosine").to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
-lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10000)
+lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20000)
 
 # --- EMA ---
 ema_state = {k: v.clone() for k, v in model.state_dict().items()}
@@ -75,7 +74,7 @@ def update_ema():
             ema_state[k].lerp_(v, 1 - ema_decay)
 
 # --- Training loop ---
-TOTAL_STEPS = 10000
+TOTAL_STEPS = 20000
 K = 4
 step = 0
 pbar = tqdm(total=TOTAL_STEPS, desc="Video DiT 16x16")
@@ -169,20 +168,20 @@ from agentdiffusion.data.lob_dataset import LOBVideoDataset
 from agentdiffusion.infer.interactive_sim import InteractiveSimulator
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-VDIT_DIR = Path("outputs/vdit_lob_16x16")
+VDIT_DIR = Path("outputs/vdit_lob_4x4")
 OB = "data/external/lobster/AMZN_2012-06-21_34200000_57600000_orderbook_10.csv"
 MSG = "data/external/lobster/AMZN_2012-06-21_34200000_57600000_message_10.csv"
 
 # Load dataset for seed frames
-dataset = LOBVideoDataset(OB, MSG, total_frames=20, cond_frames=4, subsample=10, grid_shape=(16, 16))
+dataset = LOBVideoDataset(OB, MSG, total_frames=20, cond_frames=4, subsample=10, grid_shape=(4, 4))
 d_latent = dataset[0]["frames"].shape[-1]
 
 # Load model
 ckpt_path = sorted(VDIT_DIR.glob("video_dit_step_*.pt"))[-1]
 model = VideoDiT(
     d_latent=d_latent, d_model=128, depth=6, heads=4,
-    patch_size=4, num_frames=20, num_cond_frames=4,
-    grid_h=16, grid_w=16,
+    patch_size=2, num_frames=20, num_cond_frames=4,
+    grid_h=4, grid_w=4,
 ).to(device)
 ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=True)
 model.load_state_dict(ckpt.get("ema", ckpt["model"]))
@@ -191,8 +190,11 @@ model.eval()
 scheduler = NoiseScheduler(1000, "cosine").to(device)
 sampler = VideoDDIMSampler(model, scheduler, "v_prediction", ddim_steps=50, eta=0.0)
 
-# Create interactive simulator
-sim = InteractiveSimulator(model, sampler, num_cond=4, num_gen=16, zero_sum_proj=True)
+# Create interactive simulator with SDEdit recalibration every 5 rounds
+sim = InteractiveSimulator(
+    model, sampler, num_cond=4, num_gen=16, zero_sum_proj=True,
+    recalibrate_every=5, recalibrate_strength=0.3, scheduler=scheduler,
+)
 
 # Init with real LOB frames
 seed = dataset[0]["frames"][:4]  # [4, 16, 16, d_latent]

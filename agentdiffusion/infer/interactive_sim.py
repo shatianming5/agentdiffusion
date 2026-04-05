@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import torch
 from ..models.video_dit import VideoDiT, VideoDDIMSampler
+from ..diffusion.scheduler import NoiseScheduler
 
 
 class InteractiveSimulator:
@@ -35,6 +36,9 @@ class InteractiveSimulator:
         num_gen: int = 16,
         zero_sum_proj: bool = True,
         valid_mask: torch.Tensor | None = None,
+        recalibrate_every: int = 0,
+        recalibrate_strength: float = 0.3,
+        scheduler: NoiseScheduler | None = None,
     ):
         self.model = model
         self.sampler = sampler
@@ -42,6 +46,11 @@ class InteractiveSimulator:
         self.num_gen = num_gen
         self.zero_sum_proj = zero_sum_proj
         self.valid_mask = valid_mask
+
+        # SDEdit recalibration: add noise then denoise every N steps
+        self.recalibrate_every = recalibrate_every
+        self.recalibrate_strength = recalibrate_strength
+        self.scheduler = scheduler
 
         self.device = next(model.parameters()).device
         self.buffer: torch.Tensor | None = None  # [1, T_buf, H, W, d_state]
@@ -94,7 +103,42 @@ class InteractiveSimulator:
         self.buffer = torch.cat([self.buffer, generated], dim=1)
         self.total_steps += 1
 
+        # SDEdit recalibration: add noise → denoise to prevent mode collapse
+        if (self.recalibrate_every > 0
+                and self.total_steps % self.recalibrate_every == 0
+                and self.scheduler is not None):
+            self._recalibrate()
+
         return generated[0]  # [N, H, W, D]
+
+    def _recalibrate(self):
+        """SDEdit-style recalibration: add noise at strength t, then denoise."""
+        K = self.num_cond
+        if self.buffer.shape[1] <= K:
+            return
+        # Take the last few generated frames
+        tail = self.buffer[:, -K:]  # [1, K, H, W, D]
+        B, T, H, W, D = tail.shape
+        # Add noise at a fraction of the full schedule
+        t_recal = int(self.scheduler.timesteps * self.recalibrate_strength)
+        t_tensor = torch.full((B * T,), t_recal, device=self.device, dtype=torch.long)
+        flat = tail.reshape(B * T, H, W, D)
+        noise = torch.randn_like(flat)
+        noisy = self.scheduler.q_sample(flat, t_tensor, noise)
+        # Denoise via single-step v-prediction
+        with torch.no_grad():
+            # Use the condition frames before tail
+            cond_start = max(0, self.buffer.shape[1] - 2 * K)
+            x_cond = self.buffer[:, cond_start:cond_start + K]
+            gen_shape = (B, T, H, W, D)
+            # Quick denoise: just run a few DDIM steps from the noisy state
+            denoised = self.sampler.sample(
+                x_cond, gen_shape, device=self.device,
+                zero_sum_proj=self.zero_sum_proj,
+                valid_mask=self.valid_mask,
+            )
+        # Replace tail with denoised version
+        self.buffer[:, -K:] = denoised[:, :K]
 
     def intervene(
         self,

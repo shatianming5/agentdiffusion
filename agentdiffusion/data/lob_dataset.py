@@ -238,14 +238,16 @@ class LOBVideoDataset(Dataset):
         return max(0, self.num_sequences)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        """Return T consecutive frames reshaped to [T, H, W, 1].
+        """Return T consecutive frames reshaped to [T, H, W, C].
 
-        We use C=1 since features are already flattened into H*W.
-        The "spatial" structure is the price level hierarchy.
+        C = padded_dim // (H * W).  When grid fills features exactly, C>1
+        gives the model richer per-cell information (e.g. grid=(4,4), C=3
+        for 48 LOB features → zero padding).
         """
         H, W = self.grid_shape
-        window = self.features[idx : idx + self.total_frames]  # [T, H*W]
-        frames = window.view(self.total_frames, H, W, 1)  # [T, H, W, 1]
+        C = self.padded_dim // (H * W)
+        window = self.features[idx : idx + self.total_frames]  # [T, H*W*C]
+        frames = window.view(self.total_frames, H, W, C)  # [T, H, W, C]
 
         return {
             "frames": frames,

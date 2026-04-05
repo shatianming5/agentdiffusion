@@ -24,7 +24,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 OB = "data/external/lobster/AMZN_2012-06-21_34200000_57600000_orderbook_10.csv"
 MSG = "data/external/lobster/AMZN_2012-06-21_34200000_57600000_message_10.csv"
-VDIT_DIR = Path("outputs/vdit_lob_16x16")
+VDIT_DIR = Path("outputs/vdit_lob_4x4")
 
 # --- Load real LOB data ---
 from agentdiffusion.data.lob_dataset import LOBVideoDataset, load_lobster_data
@@ -42,14 +42,14 @@ from agentdiffusion.models.video_dit import VideoDiT, VideoDDIMSampler
 from agentdiffusion.diffusion.scheduler import NoiseScheduler
 from agentdiffusion.infer.interactive_sim import InteractiveSimulator
 
-dataset = LOBVideoDataset(OB, MSG, total_frames=20, cond_frames=4, subsample=10, grid_shape=(16, 16))
+dataset = LOBVideoDataset(OB, MSG, total_frames=20, cond_frames=4, subsample=10, grid_shape=(4, 4))
 d_latent = dataset[0]["frames"].shape[-1]
 
 ckpt_path = sorted(VDIT_DIR.glob("video_dit_step_*.pt"))[-1]
 model = VideoDiT(
     d_latent=d_latent, d_model=128, depth=6, heads=4,
-    patch_size=4, num_frames=20, num_cond_frames=4,
-    grid_h=16, grid_w=16,
+    patch_size=2, num_frames=20, num_cond_frames=4,
+    grid_h=4, grid_w=4,
 ).to(device)
 ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=True)
 model.load_state_dict(ckpt.get("ema", ckpt["model"]))
