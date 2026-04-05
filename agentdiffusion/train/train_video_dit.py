@@ -141,7 +141,7 @@ class VideoDiTTrainer:
         # --- Video DiT model ---
         self.model = build_video_dit(cfg).to(self.device)
         if self._distributed:
-            self.model = DDP(self.model, device_ids=[self.local_rank])
+            self.model = DDP(self.model, device_ids=[self.local_rank], find_unused_parameters=True)
 
         # --- Noise scheduler (cosine) ---
         self.scheduler = NoiseScheduler(
