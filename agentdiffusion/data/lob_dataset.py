@@ -207,9 +207,11 @@ class LOBVideoDataset(Dataset):
         # Normalize
         normed, self.norm_stats = normalize_lob_features(raw_features)
 
-        # Pad feature_dim to H*W*C
+        # Pad feature_dim to H*W*C (auto-compute C = ceil(feature_dim / (H*W)))
+        import math
         H, W = grid_shape
-        target_dim = H * W
+        C = max(1, math.ceil(self.feature_dim / (H * W)))
+        target_dim = H * W * C
         if self.feature_dim < target_dim:
             pad_width = target_dim - self.feature_dim
             normed = np.pad(normed, ((0, 0), (0, pad_width)))
