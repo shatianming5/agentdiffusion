@@ -97,6 +97,100 @@ def load_stock_l3(
     return {"orders": orders, "trades": trades, "snapshots": snapshots}
 
 
+MARKET_COND_DIM = 8  # number of market conditioning features
+
+
+def build_market_conditions(
+    snapshots: pd.DataFrame,
+    time_edges: np.ndarray,
+) -> np.ndarray:
+    """Extract market-level conditioning from 10-level snapshots.
+
+    Returns: [T, MARKET_COND_DIM] with features:
+        0: mid_price_return (log return of mid price)
+        1: spread (best ask - best bid, normalized)
+        2: depth_imbalance (bid_vol - ask_vol) / (bid_vol + ask_vol)
+        3: trade_intensity (trades per second proxy from snapshot frequency)
+        4: volatility (rolling std of mid returns)
+        5: price_momentum (cumulative return over 5 windows)
+        6: total_depth (log total volume at all levels)
+        7: time_of_day (normalized 0=open, 1=close)
+    """
+    T = len(time_edges) - 1
+    conds = np.zeros((T, MARKET_COND_DIM), dtype=np.float32)
+
+    # Align snapshots to time windows
+    snap_ts = snapshots["timestamp"].values
+    ask_p1 = snapshots.get("ask_p1", pd.Series(dtype=float)).values
+    bid_p1 = snapshots.get("bid_p1", pd.Series(dtype=float)).values
+    ask_v1 = snapshots.get("ask_v1", pd.Series(dtype=float)).values
+    bid_v1 = snapshots.get("bid_v1", pd.Series(dtype=float)).values
+
+    if len(ask_p1) == 0 or np.all(ask_p1 == 0):
+        return conds
+
+    mid = (ask_p1 + bid_p1) / 2.0
+    mid[mid <= 0] = np.nan
+
+    # Compute per-window features
+    prev_mid = np.nan
+    returns_buffer = []
+    for t in range(T):
+        mask = (snap_ts >= time_edges[t]) & (snap_ts < time_edges[t + 1])
+        if mask.sum() == 0:
+            if t > 0:
+                conds[t] = conds[t - 1]
+            continue
+
+        idx = np.where(mask)[0]
+        w_mid = np.nanmean(mid[idx])
+        w_ask = np.nanmean(ask_p1[idx])
+        w_bid = np.nanmean(bid_p1[idx])
+        w_ask_v = np.nanmean(ask_v1[idx])
+        w_bid_v = np.nanmean(bid_v1[idx])
+
+        # 0: mid price return
+        ret = np.log(w_mid / prev_mid) if prev_mid > 0 and w_mid > 0 else 0.0
+        conds[t, 0] = np.clip(ret * 1000, -5, 5)  # scale up, clip
+        prev_mid = w_mid
+
+        # 1: spread
+        spread = (w_ask - w_bid) / max(w_mid, 1e-8) * 10000  # bps
+        conds[t, 1] = np.clip(spread / 50, -5, 5)  # normalize
+
+        # 2: depth imbalance
+        total = w_bid_v + w_ask_v
+        conds[t, 2] = (w_bid_v - w_ask_v) / max(total, 1) if total > 0 else 0
+
+        # 3: trade intensity (number of snapshots as proxy)
+        conds[t, 3] = np.clip(mask.sum() / 10.0, 0, 5)
+
+        # 4: volatility (rolling std of returns)
+        returns_buffer.append(ret)
+        if len(returns_buffer) > 20:
+            returns_buffer = returns_buffer[-20:]
+        conds[t, 4] = np.clip(np.std(returns_buffer) * 1000, 0, 5)
+
+        # 5: momentum (5-window cumulative return)
+        conds[t, 5] = np.clip(sum(returns_buffer[-5:]) * 1000, -5, 5)
+
+        # 6: total depth
+        total_vol = 0
+        for lv in range(1, 11):
+            av = snapshots.get(f"ask_v{lv}")
+            bv = snapshots.get(f"bid_v{lv}")
+            if av is not None:
+                total_vol += np.nanmean(av.values[idx])
+            if bv is not None:
+                total_vol += np.nanmean(bv.values[idx])
+        conds[t, 6] = np.clip(np.log1p(total_vol) / 15, 0, 5)
+
+        # 7: time of day (0=9:30, 1=15:00)
+        conds[t, 7] = np.clip((time_edges[t] - 34200) / (54000 - 34200), 0, 1)
+
+    return conds
+
+
 def build_agent_states_from_orders(
     orders: pd.DataFrame,
     window_seconds: float = 1.0,
@@ -228,17 +322,20 @@ class AShareL3VideoDataset(Dataset):
         logger.info(f"Loading {len(stock_dirs)} stocks from {data_dir}")
 
         # Build all sequences
-        self.all_sequences = []  # list of [T_total, H, W, C] tensors
+        self.all_sequences = []   # list of [T, H, W, C] tensors
+        self.all_market_conds = []  # list of [T, MARKET_COND_DIM] tensors
         H, W = grid_shape
         n_agents = H * W
 
         for sd in stock_dirs:
             try:
                 data = load_stock_l3(sd)
-                states, _ = build_agent_states_from_orders(
+                states, time_edges = build_agent_states_from_orders(
                     data["orders"], window_seconds=window_seconds,
                     n_agent_types=n_agents,
                 )
+                # Build market conditions aligned to same time windows
+                market_conds = build_market_conditions(data["snapshots"], time_edges)
             except Exception as e:
                 logger.warning(f"Failed to load {sd.name}: {e}")
                 continue
@@ -246,7 +343,7 @@ class AShareL3VideoDataset(Dataset):
             if len(states) < total_frames:
                 continue
 
-            # Normalize per-feature
+            # Normalize agent states per-feature
             d_state = states.shape[-1]
             flat = states.reshape(-1, d_state)
             mean = flat.mean(axis=0, keepdims=True)
@@ -261,8 +358,10 @@ class AShareL3VideoDataset(Dataset):
             # Split into sequences
             for i in range(0, T_total - total_frames + 1, total_frames // 2):
                 seq = grid[i:i + total_frames]
-                if len(seq) == total_frames:
+                mc = market_conds[i:i + total_frames]
+                if len(seq) == total_frames and len(mc) == total_frames:
                     self.all_sequences.append(torch.from_numpy(seq).float())
+                    self.all_market_conds.append(torch.from_numpy(mc).float())
 
         logger.info(
             f"AShareL3VideoDataset: {len(stock_dirs)} stocks → "
@@ -275,7 +374,8 @@ class AShareL3VideoDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         frames = self.all_sequences[idx]  # [T, H, W, C]
+        market_conds = self.all_market_conds[idx]  # [T, MARKET_COND_DIM]
         return {
             "frames": frames,
-            "market_conds": torch.zeros(self.total_frames, 32),
+            "market_conds": market_conds,
         }

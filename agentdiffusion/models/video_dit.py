@@ -80,24 +80,57 @@ class SpatialAttention(nn.Module):
 class TemporalAttention(nn.Module):
     """Self-attention across frames for each spatial position.
 
+    Supports causal masking (each frame only attends to current + past frames)
+    and ALiBi-style relative position bias for temporal locality.
+
     Input:  [B*N_patches, T, D]
     Output: [B*N_patches, T, D]
     """
 
-    def __init__(self, d_model: int, heads: int, dropout: float = 0.0):
+    def __init__(self, d_model: int, heads: int, dropout: float = 0.0,
+                 causal: bool = False, alibi: bool = False):
         super().__init__()
         self.heads = heads
         self.head_dim = d_model // heads
         self.qkv = nn.Linear(d_model, d_model * 3)
         self.out_proj = nn.Linear(d_model, d_model)
         self.dropout = dropout
+        self.causal = causal
+        self.alibi = alibi
+
+        if alibi:
+            # ALiBi slopes: geometric sequence for each head
+            slopes = 2.0 ** (-8.0 * torch.arange(1, heads + 1) / heads)
+            self.register_buffer("alibi_slopes", slopes)  # [H]
+
+    def _build_alibi_bias(self, T: int, device: torch.device) -> torch.Tensor:
+        """Build ALiBi position bias: [1, H, T, T]."""
+        pos = torch.arange(T, device=device)
+        rel = pos.unsqueeze(0) - pos.unsqueeze(1)  # [T, T], rel[i,j] = j - i
+        bias = rel.float().unsqueeze(0) * self.alibi_slopes.unsqueeze(1).unsqueeze(2)
+        return bias.unsqueeze(0)  # [1, H, T, T]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
         qkv = self.qkv(x).reshape(B, T, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
+
+        # Build attention mask
+        attn_mask = None
+        if self.causal or self.alibi:
+            # Start with zero bias
+            bias = torch.zeros(1, 1, T, T, device=x.device)
+            if self.alibi:
+                bias = bias + self._build_alibi_bias(T, x.device)
+            if self.causal:
+                causal_mask = torch.triu(
+                    torch.full((T, T), float("-inf"), device=x.device), diagonal=1
+                )
+                bias = bias + causal_mask.unsqueeze(0).unsqueeze(0)
+            attn_mask = bias.expand(B, self.heads, T, T)
+
         out = F.scaled_dot_product_attention(
-            q, k, v,
+            q, k, v, attn_mask=attn_mask,
             dropout_p=self.dropout if self.training else 0.0,
         )
         out = rearrange(out, "b h t d -> b t (h d)")
@@ -126,6 +159,8 @@ class VideoDiTBlock(nn.Module):
         heads: int,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        causal_temporal: bool = False,
+        alibi_temporal: bool = False,
     ):
         super().__init__()
         # --- Spatial attention sub-block ---
@@ -136,7 +171,9 @@ class VideoDiTBlock(nn.Module):
         # --- Temporal attention sub-block ---
         self.adaln_temporal = AdaLNZeroModulation(d_model)
         self.norm_temporal = nn.LayerNorm(d_model, elementwise_affine=False)
-        self.temporal_attn = TemporalAttention(d_model, heads, dropout)
+        self.temporal_attn = TemporalAttention(
+            d_model, heads, dropout, causal=causal_temporal, alibi=alibi_temporal,
+        )
 
         # --- FFN sub-block ---
         self.adaln_ffn = AdaLNZeroModulation(d_model)
@@ -291,6 +328,8 @@ class VideoDiT(nn.Module):
         num_cond_frames: int = 8,
         market_cond_dim: int = 32,
         dropout: float = 0.0,
+        causal_temporal: bool = False,
+        alibi_temporal: bool = False,
     ):
         super().__init__()
         self.d_latent = d_latent
@@ -334,6 +373,8 @@ class VideoDiT(nn.Module):
                 heads=heads,
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
+                causal_temporal=causal_temporal,
+                alibi_temporal=alibi_temporal,
             )
             for _ in range(depth)
         ])
@@ -599,4 +640,6 @@ def build_video_dit(cfg) -> VideoDiT:
         num_cond_frames=cfg.video.num_cond_frames,
         market_cond_dim=getattr(cfg.model, "market_cond_dim", 32),
         dropout=cfg.model.dropout,
+        causal_temporal=getattr(cfg.model, "causal_temporal", False),
+        alibi_temporal=getattr(cfg.model, "alibi_temporal", False),
     )
