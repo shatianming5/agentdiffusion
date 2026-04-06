@@ -99,8 +99,8 @@ class TemporalAttention(nn.Module):
         self.alibi = alibi
 
         if alibi:
-            # ALiBi slopes: geometric sequence for each head
-            slopes = 2.0 ** (-8.0 * torch.arange(1, heads + 1) / heads)
+            # ALiBi slopes: gentler geometric sequence (scaled down for short T)
+            slopes = 2.0 ** (-4.0 * torch.arange(1, heads + 1) / heads)  # -4 not -8
             self.register_buffer("alibi_slopes", slopes)  # [H]
 
     def _build_alibi_bias(self, T: int, device: torch.device) -> torch.Tensor:
@@ -108,7 +108,7 @@ class TemporalAttention(nn.Module):
         pos = torch.arange(T, device=device)
         rel = pos.unsqueeze(0) - pos.unsqueeze(1)  # [T, T], rel[i,j] = j - i
         bias = rel.float().unsqueeze(0) * self.alibi_slopes.unsqueeze(1).unsqueeze(2)
-        return bias.unsqueeze(0)  # [1, H, T, T]
+        return bias.clamp(-10, 0).unsqueeze(0)  # [1, H, T, T], clamp for stability
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape

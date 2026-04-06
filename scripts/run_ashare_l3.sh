@@ -77,7 +77,7 @@ model = VideoDiT(
     patch_size=2, num_frames=20, num_cond_frames=4,
     mlp_ratio=4.0, market_cond_dim=MARKET_COND_DIM,
     grid_h=4, grid_w=4,
-    causal_temporal=True, alibi_temporal=False,
+    causal_temporal=True, alibi_temporal=True,
 ).to(device)
 logger.info(f"DiT params: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
@@ -142,16 +142,17 @@ while step < TOTAL_STEPS:
 
         loss_diff = F.mse_loss(v_pred, v_target)
 
-        # --- Order Decoder loss (detached from DiT to prevent NaN) ---
-        with torch.no_grad():
-            v_pred_flat = v_pred.reshape(B * N, H, W, C)
-            z0_pred_flat = scheduler.predict_x0_from_v(
-                z_noisy.reshape(B * N, H, W, C), t_exp, v_pred_flat)
-            z0_pred = z0_pred_flat.reshape(B, N, H, W, C).detach()
+        # --- Order Decoder loss (gradient clamp for stability) ---
+        v_pred_flat = v_pred.reshape(B * N, H, W, C)
+        z0_pred_flat = scheduler.predict_x0_from_v(
+            z_noisy.reshape(B * N, H, W, C), t_exp, v_pred_flat)
+        # Clamp x0 prediction to prevent extreme values at high t
+        z0_pred = z0_pred_flat.clamp(-10, 10).reshape(B, N, H, W, C)
 
         pred_orders = order_decoder.decode_sequence(
-            torch.cat([z_cond[:, -1:].detach(), z0_pred], dim=1))
-        gt_orders = order_decoder.decode_sequence(frames[:, K-1:].detach())
+            torch.cat([z_cond[:, -1:], z0_pred], dim=1))
+        with torch.no_grad():
+            gt_orders = order_decoder.decode_sequence(frames[:, K-1:])
         loss_order = F.mse_loss(pred_orders, gt_orders)
 
         loss = loss_diff + LAMBDA_ORDER * loss_order
