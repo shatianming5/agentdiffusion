@@ -132,61 +132,78 @@ def build_market_conditions(
     mid = (ask_p1 + bid_p1) / 2.0
     mid[mid <= 0] = np.nan
 
-    # Compute per-window features
-    prev_mid = np.nan
-    returns_buffer = []
-    for t in range(T):
-        mask = (snap_ts >= time_edges[t]) & (snap_ts < time_edges[t + 1])
-        if mask.sum() == 0:
-            if t > 0:
-                conds[t] = conds[t - 1]
-            continue
+    # --- Vectorized: assign snapshots to time bins, aggregate ---
+    time_bin = np.digitize(snap_ts, time_edges) - 1
+    time_bin = np.clip(time_bin, 0, T - 1)
 
-        idx = np.where(mask)[0]
-        w_mid = np.nanmean(mid[idx])
-        w_ask = np.nanmean(ask_p1[idx])
-        w_bid = np.nanmean(bid_p1[idx])
-        w_ask_v = np.nanmean(ask_v1[idx])
-        w_bid_v = np.nanmean(bid_v1[idx])
+    # Per-bin aggregates via bincount
+    bc_count = np.bincount(time_bin, minlength=T).astype(np.float64)
+    bc_mid = np.bincount(time_bin, weights=np.nan_to_num(mid), minlength=T)
+    bc_ask = np.bincount(time_bin, weights=np.nan_to_num(ask_p1), minlength=T)
+    bc_bid = np.bincount(time_bin, weights=np.nan_to_num(bid_p1), minlength=T)
+    bc_askv = np.bincount(time_bin, weights=np.nan_to_num(ask_v1), minlength=T)
+    bc_bidv = np.bincount(time_bin, weights=np.nan_to_num(bid_v1), minlength=T)
 
-        # 0: mid price return
-        ret = np.log(w_mid / prev_mid) if prev_mid > 0 and w_mid > 0 else 0.0
-        conds[t, 0] = np.clip(ret * 1000, -5, 5)  # scale up, clip
-        prev_mid = w_mid
+    safe_count = np.where(bc_count > 0, bc_count, 1)
+    w_mid_arr = bc_mid[:T] / safe_count[:T]
+    w_ask_arr = bc_ask[:T] / safe_count[:T]
+    w_bid_arr = bc_bid[:T] / safe_count[:T]
+    w_askv_arr = bc_askv[:T] / safe_count[:T]
+    w_bidv_arr = bc_bidv[:T] / safe_count[:T]
 
-        # 1: spread
-        spread = (w_ask - w_bid) / max(w_mid, 1e-8) * 10000  # bps
-        conds[t, 1] = np.clip(spread / 50, -5, 5)  # normalize
+    # Total depth (sum all 10 levels)
+    total_depth = np.zeros(T, dtype=np.float64)
+    for lv in range(1, 11):
+        av = snapshots.get(f"ask_v{lv}")
+        bv = snapshots.get(f"bid_v{lv}")
+        if av is not None:
+            total_depth += np.bincount(time_bin, weights=np.nan_to_num(av.values), minlength=T)[:T] / safe_count[:T]
+        if bv is not None:
+            total_depth += np.bincount(time_bin, weights=np.nan_to_num(bv.values), minlength=T)[:T] / safe_count[:T]
 
-        # 2: depth imbalance
-        total = w_bid_v + w_ask_v
-        conds[t, 2] = (w_bid_v - w_ask_v) / max(total, 1) if total > 0 else 0
+    # Compute features vectorized
+    # 0: mid return
+    w_mid_safe = np.where(w_mid_arr > 0, w_mid_arr, np.nan)
+    returns = np.zeros(T)
+    returns[1:] = np.diff(np.log(np.nan_to_num(w_mid_safe, nan=1.0) + 1e-12))
+    returns = np.nan_to_num(returns, nan=0.0)
+    conds[:, 0] = np.clip(returns * 1000, -5, 5)
 
-        # 3: trade intensity (number of snapshots as proxy)
-        conds[t, 3] = np.clip(mask.sum() / 10.0, 0, 5)
+    # 1: spread (bps)
+    spread = (w_ask_arr - w_bid_arr) / np.maximum(w_mid_arr, 1e-8) * 10000
+    conds[:, 1] = np.clip(spread / 50, -5, 5)
 
-        # 4: volatility (rolling std of returns)
-        returns_buffer.append(ret)
-        if len(returns_buffer) > 20:
-            returns_buffer = returns_buffer[-20:]
-        conds[t, 4] = np.clip(np.std(returns_buffer) * 1000, 0, 5)
+    # 2: depth imbalance
+    total_bav = w_bidv_arr + w_askv_arr
+    conds[:, 2] = np.where(total_bav > 0, (w_bidv_arr - w_askv_arr) / total_bav, 0)
 
-        # 5: momentum (5-window cumulative return)
-        conds[t, 5] = np.clip(sum(returns_buffer[-5:]) * 1000, -5, 5)
+    # 3: trade intensity
+    conds[:, 3] = np.clip(bc_count[:T] / 10.0, 0, 5)
 
-        # 6: total depth
-        total_vol = 0
-        for lv in range(1, 11):
-            av = snapshots.get(f"ask_v{lv}")
-            bv = snapshots.get(f"bid_v{lv}")
-            if av is not None:
-                total_vol += np.nanmean(av.values[idx])
-            if bv is not None:
-                total_vol += np.nanmean(bv.values[idx])
-        conds[t, 6] = np.clip(np.log1p(total_vol) / 15, 0, 5)
+    # 4: volatility (rolling std of returns, window=20)
+    from numpy.lib.stride_tricks import sliding_window_view
+    if T > 20:
+        windowed = sliding_window_view(returns, 20)
+        vol = np.std(windowed, axis=1)
+        conds[19:, 4] = np.clip(vol * 1000, 0, 5)
 
-        # 7: time of day (0=9:30, 1=15:00)
-        conds[t, 7] = np.clip((time_edges[t] - 34200) / (54000 - 34200), 0, 1)
+    # 5: momentum (5-window cumsum)
+    if T > 5:
+        cum = np.cumsum(returns)
+        mom = np.zeros(T)
+        mom[5:] = cum[5:] - cum[:-5]
+        conds[:, 5] = np.clip(mom * 1000, -5, 5)
+
+    # 6: total depth
+    conds[:, 6] = np.clip(np.log1p(total_depth) / 15, 0, 5)
+
+    # 7: time of day
+    conds[:, 7] = np.clip((time_edges[:T] - 34200) / (54000 - 34200), 0, 1)
+
+    # Forward-fill empty windows
+    for t in range(1, T):
+        if bc_count[t] == 0:
+            conds[t] = conds[t - 1]
 
     return conds
 
@@ -252,36 +269,58 @@ def build_agent_states_from_orders(
     time_edges = np.arange(t_min, t_max + window_seconds, window_seconds)
     T = len(time_edges) - 1
 
+    # --- Vectorized aggregation (replaces double for-loop) ---
     d_state = 6
     agent_states = np.zeros((T, n_agent_types, d_state), dtype=np.float32)
 
-    for t in range(T):
-        mask = (orders["timestamp"] >= time_edges[t]) & (orders["timestamp"] < time_edges[t + 1])
-        window = orders[mask]
-        if len(window) == 0:
-            continue
+    # Assign each order to a time bin
+    ts = orders["timestamp"].values
+    time_bin = np.digitize(ts, time_edges) - 1  # [0, T-1]
+    time_bin = np.clip(time_bin, 0, T - 1)
 
-        for a in range(n_agent_types):
-            a_mask = window["agent_type"] == a
-            a_orders = window[a_mask]
-            if len(a_orders) == 0:
-                continue
+    # Pre-extract arrays for speed
+    at = agent_type  # already computed above
+    sz = orders["size"].values.astype(np.float64)
+    dr = orders["direction"].values.astype(np.float64)
+    pr = orders["price"].values.astype(np.float64)
+    ot = orders["order_type"].values
 
-            signed_vol = (a_orders["size"] * a_orders["direction"]).sum()
-            n_orders = len(a_orders)
-            avg_price = (a_orders["price"] * a_orders["size"]).sum() / max(a_orders["size"].sum(), 1)
-            cancel_count = (a_orders["order_type"] == 3).sum()  # type 3 = cancel
-            avg_size = a_orders["size"].mean()
-            aggr_frac = a_orders["agent_type"].apply(lambda x: x % 2).mean()
+    signed_vol = sz * dr
+    price_x_size = pr * sz
+    is_cancel = (ot == 3).astype(np.float64)
+    is_aggr = (at % 2).astype(np.float64)
 
-            agent_states[t, a, 0] = signed_vol
-            agent_states[t, a, 1] = n_orders
-            agent_states[t, a, 2] = avg_price
-            agent_states[t, a, 3] = cancel_count / max(n_orders, 1)
-            agent_states[t, a, 4] = avg_size
-            agent_states[t, a, 5] = aggr_frac
+    # Composite key: (time_bin, agent_type) → single int for np.bincount
+    key = time_bin * n_agent_types + at
+    n_bins = T * n_agent_types
 
-    return agent_states, time_edges
+    # Aggregate with bincount (one pass, no loops)
+    sum_signed_vol = np.bincount(key, weights=signed_vol, minlength=n_bins)
+    sum_count = np.bincount(key, minlength=n_bins).astype(np.float64)
+    sum_price_x_size = np.bincount(key, weights=price_x_size, minlength=n_bins)
+    sum_size = np.bincount(key, weights=sz, minlength=n_bins)
+    sum_cancel = np.bincount(key, weights=is_cancel, minlength=n_bins)
+    sum_aggr = np.bincount(key, weights=is_aggr, minlength=n_bins)
+
+    # Reshape to [T, n_agent_types]
+    sum_signed_vol = sum_signed_vol[:n_bins].reshape(T, n_agent_types)
+    sum_count = sum_count[:n_bins].reshape(T, n_agent_types)
+    sum_price_x_size = sum_price_x_size[:n_bins].reshape(T, n_agent_types)
+    sum_size = sum_size[:n_bins].reshape(T, n_agent_types)
+    sum_cancel = sum_cancel[:n_bins].reshape(T, n_agent_types)
+    sum_aggr = sum_aggr[:n_bins].reshape(T, n_agent_types)
+
+    # Fill agent_states
+    agent_states[:, :, 0] = sum_signed_vol                                     # net_position
+    agent_states[:, :, 1] = sum_count                                          # order_rate
+    safe_size = np.where(sum_size > 0, sum_size, 1)
+    agent_states[:, :, 2] = sum_price_x_size / safe_size                       # avg_price
+    safe_count = np.where(sum_count > 0, sum_count, 1)
+    agent_states[:, :, 3] = sum_cancel / safe_count                            # cancel_rate
+    agent_states[:, :, 4] = sum_size / safe_count                              # avg_size
+    agent_states[:, :, 5] = sum_aggr / safe_count                              # aggressiveness
+
+    return agent_states.astype(np.float32), time_edges
 
 
 class AShareL3VideoDataset(Dataset):

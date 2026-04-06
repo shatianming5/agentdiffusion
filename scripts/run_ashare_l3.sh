@@ -77,7 +77,7 @@ model = VideoDiT(
     patch_size=2, num_frames=20, num_cond_frames=4,
     mlp_ratio=4.0, market_cond_dim=MARKET_COND_DIM,
     grid_h=4, grid_w=4,
-    causal_temporal=True, alibi_temporal=True,
+    causal_temporal=True, alibi_temporal=False,
 ).to(device)
 logger.info(f"DiT params: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
@@ -90,7 +90,7 @@ logger.info(f"Decoder params: {sum(p.numel() for p in order_decoder.parameters()
 
 scheduler = NoiseScheduler(1000, "cosine").to(device)
 all_params = list(model.parameters()) + list(order_decoder.parameters())
-optimizer = torch.optim.AdamW(all_params, lr=3e-4, weight_decay=0.01)
+optimizer = torch.optim.AdamW(all_params, lr=1e-4, weight_decay=0.01)
 TOTAL_STEPS = 20000
 lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=TOTAL_STEPS)
 LAMBDA_ORDER = 0.1  # weight for order reconstruction loss
@@ -142,19 +142,16 @@ while step < TOTAL_STEPS:
 
         loss_diff = F.mse_loss(v_pred, v_target)
 
-        # --- Order Decoder loss: reconstruct order features from predicted x0 ---
-        # Recover x0 from v-prediction (single-step estimate)
-        v_pred_flat = v_pred.reshape(B * N, H, W, C)
-        z0_pred_flat = scheduler.predict_x0_from_v(
-            z_noisy.reshape(B * N, H, W, C), t_exp, v_pred_flat)
-        z0_pred = z0_pred_flat.reshape(B, N, H, W, C)
-
-        # Decode: predicted agent grid → order queries
-        pred_orders = order_decoder.decode_sequence(
-            torch.cat([z_cond[:, -1:], z0_pred], dim=1))  # [B, N, 64, 6]
-        # Target: decode from ground truth agent grid
+        # --- Order Decoder loss (detached from DiT to prevent NaN) ---
         with torch.no_grad():
-            gt_orders = order_decoder.decode_sequence(frames[:, K-1:])  # [B, N, 64, 6]
+            v_pred_flat = v_pred.reshape(B * N, H, W, C)
+            z0_pred_flat = scheduler.predict_x0_from_v(
+                z_noisy.reshape(B * N, H, W, C), t_exp, v_pred_flat)
+            z0_pred = z0_pred_flat.reshape(B, N, H, W, C).detach()
+
+        pred_orders = order_decoder.decode_sequence(
+            torch.cat([z_cond[:, -1:].detach(), z0_pred], dim=1))
+        gt_orders = order_decoder.decode_sequence(frames[:, K-1:].detach())
         loss_order = F.mse_loss(pred_orders, gt_orders)
 
         loss = loss_diff + LAMBDA_ORDER * loss_order
