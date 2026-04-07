@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 from pathlib import Path
+import re
 
 from agentdiffusion.models.video_dit import VideoDiT, VideoDDIMSampler
 from agentdiffusion.models.order_decoder import AgentToOrderDecoder
@@ -23,12 +24,18 @@ OB = "data/external/lobster/AMZN_2012-06-21_34200000_57600000_orderbook_10.csv"
 MSG = "data/external/lobster/AMZN_2012-06-21_34200000_57600000_message_10.csv"
 VDIT_DIR = Path("outputs/vdit_lob_8x8_enhanced_v2")
 
+
+def checkpoint_step(path: Path) -> int:
+    match = re.search(r"step_(\d+)", path.stem)
+    return int(match.group(1)) if match else -1
+
+
 # Check if v2 model exists
-ckpts = sorted(VDIT_DIR.glob("video_dit_step_*.pt")) if VDIT_DIR.exists() else []
+ckpts = sorted(VDIT_DIR.glob("video_dit_step_*.pt"), key=checkpoint_step) if VDIT_DIR.exists() else []
 if not ckpts:
     # Fall back to v1
     VDIT_DIR = Path("outputs/vdit_lob_8x8_enhanced")
-    ckpts = sorted(VDIT_DIR.glob("video_dit_step_*.pt"))
+    ckpts = sorted(VDIT_DIR.glob("video_dit_step_*.pt"), key=checkpoint_step)
     if not ckpts:
         print("[ERROR] No enhanced model found")
         import sys; sys.exit(1)
@@ -110,11 +117,15 @@ pred_cat = torch.cat(all_pred_orders, dim=0)
 gt_dir = (gt_cat[..., 2] > 0).float()
 pred_dir = (pred_cat[..., 2] > 0).float()
 dir_acc = (gt_dir == pred_dir).float().mean().item()
+gt_dir_pos_rate = gt_dir.mean().item()
+pred_dir_pos_rate = pred_dir.mean().item()
 
 # Activity accuracy (dim 5)
 gt_act = (gt_cat[..., 5] > 0).float()
 pred_act = (pred_cat[..., 5] > 0).float()
 act_acc = (gt_act == pred_act).float().mean().item()
+gt_act_rate = gt_act.mean().item()
+pred_act_rate = pred_act.mean().item()
 
 # Size MAE (dim 1)
 size_mae = (gt_cat[..., 1] - pred_cat[..., 1]).abs().mean().item()
@@ -126,10 +137,16 @@ price_mae = (gt_cat[..., 0] - pred_cat[..., 0]).abs().mean().item()
 overall_mse = F.mse_loss(pred_cat, gt_cat).item()
 
 print("  Direction accuracy:  {:.1f}%".format(dir_acc * 100))
+print("  GT direction + rate: {:.1f}%".format(gt_dir_pos_rate * 100))
+print("  Pred direction + rate:{:.1f}%".format(pred_dir_pos_rate * 100))
 print("  Activity accuracy:   {:.1f}%".format(act_acc * 100))
+print("  GT activity rate:    {:.1f}%".format(gt_act_rate * 100))
+print("  Pred activity rate:  {:.1f}%".format(pred_act_rate * 100))
 print("  Size MAE:            {:.4f}".format(size_mae))
 print("  Price MAE:           {:.4f}".format(price_mae))
 print("  Overall MSE:         {:.6f}".format(overall_mse))
+if gt_act_rate in (0.0, 1.0) or gt_dir_pos_rate in (0.0, 1.0):
+    print("  [WARN] Decoder classification heads are degenerate on GT samples; accuracy is not informative.")
 
 # ============================================================
 # Part 2: Generate LOBSTER-format messages
@@ -141,16 +158,14 @@ seed = dataset[0]["frames"][:4]
 sim.init(seed)
 
 # Generate 5 rounds
-all_frames = [seed]
+all_frames = [seed.unsqueeze(0)]
 for _ in range(5):
-    gen = sim.step()
+    gen = sim.step().cpu()
     all_frames.append(gen.unsqueeze(0))
     sim.trim_buffer(keep_last=8)
 
 # Decode all frames to orders
-gen_frames = torch.cat(all_frames, dim=0 if all_frames[0].dim() == 4 else 1)
-if gen_frames.dim() == 4:
-    gen_frames = gen_frames.unsqueeze(0)
+gen_frames = torch.cat(all_frames, dim=1)
 
 with torch.no_grad():
     orders = decoder.decode_sequence(gen_frames[:, :20].to(device))  # [1, 19, 64, 6]
@@ -191,11 +206,14 @@ msg_df.to_csv(msg_path, index=False, header=False)
 
 print("  Generated {} LOBSTER messages".format(len(msg_df)))
 print("  Saved to {}".format(msg_path))
-print("  Price range: {} - {}".format(msg_df["Price"].min(), msg_df["Price"].max()))
-print("  Size range:  {} - {}".format(msg_df["Size"].min(), msg_df["Size"].max()))
-print("  Buy/Sell:    {:.1f}% / {:.1f}%".format(
-    (msg_df["Direction"] == 1).mean() * 100,
-    (msg_df["Direction"] == -1).mean() * 100))
+if msg_df.empty:
+    print("  No active orders were emitted")
+else:
+    print("  Price range: {} - {}".format(msg_df["Price"].min(), msg_df["Price"].max()))
+    print("  Size range:  {} - {}".format(msg_df["Size"].min(), msg_df["Size"].max()))
+    print("  Buy/Sell:    {:.1f}% / {:.1f}%".format(
+        (msg_df["Direction"] == 1).mean() * 100,
+        (msg_df["Direction"] == -1).mean() * 100))
 
 print("\n" + "=" * 64)
 print("  DONE")

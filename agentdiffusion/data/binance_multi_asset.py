@@ -30,7 +30,6 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from zipfile import ZipFile
-import io
 
 import numpy as np
 import pandas as pd
@@ -57,11 +56,25 @@ def load_aggtrades_zip(zip_path: str | Path) -> pd.DataFrame:
         with zf.open(csv_name) as f:
             df = pd.read_csv(
                 f,
-                names=["agg_id", "price", "qty", "first_id", "last_id", "timestamp", "is_buyer_maker", "best_match"],
-                dtype={"price": float, "qty": float, "timestamp": int, "is_buyer_maker": bool},
+                header=None,
+                usecols=[1, 2, 5, 6],
+                dtype={1: np.float32, 2: np.float32, 5: np.int64, 6: np.int8},
             )
-    df["timestamp_s"] = df["timestamp"] / 1000.0  # ms → seconds
+    df.columns = ["price", "qty", "timestamp", "is_buyer_maker"]
     return df
+
+
+def _forward_fill_features(features: np.ndarray, active_mask: np.ndarray) -> np.ndarray:
+    """Carry the previous window forward for empty windows."""
+    if active_mask.all() or not active_mask.any():
+        return features
+
+    last_seen = np.maximum.accumulate(
+        np.where(active_mask, np.arange(len(active_mask)), -1)
+    )
+    valid = last_seen >= 0
+    features[valid] = features[last_seen[valid]]
+    return features
 
 
 def aggregate_per_window(
@@ -72,44 +85,81 @@ def aggregate_per_window(
 
     Returns: [T, D_STATE] array of features.
     """
-    ts = df["timestamp_s"].values
-    t_min, t_max = ts.min(), ts.max()
-    edges = np.arange(t_min, t_max + window_seconds, window_seconds)
-    T = len(edges) - 1
+    if df.empty:
+        return np.zeros((0, D_STATE), dtype=np.float32)
+
+    timestamps = df["timestamp"].to_numpy(dtype=np.int64, copy=False)
+    order = np.argsort(timestamps, kind="stable")
+    timestamps = timestamps[order]
+    prices = df["price"].to_numpy(dtype=np.float64, copy=False)[order]
+    qtys = df["qty"].to_numpy(dtype=np.float64, copy=False)[order]
+    is_buyer = df["is_buyer_maker"].to_numpy(dtype=np.float64, copy=False)[order]
+
+    window_ms = max(int(window_seconds * 1000), 1)
+    time_bin = ((timestamps - timestamps[0]) // window_ms).astype(np.int64)
+    T = int(time_bin[-1]) + 1
 
     features = np.zeros((T, D_STATE), dtype=np.float32)
-    prices = df["price"].values
-    qtys = df["qty"].values
-    is_buyer = df["is_buyer_maker"].values
+    counts = np.bincount(time_bin, minlength=T).astype(np.float64)
+    active = counts > 0
+    if not active.any():
+        return features
 
-    time_bin = np.digitize(ts, edges) - 1
-    time_bin = np.clip(time_bin, 0, T - 1)
+    sum_price = np.bincount(time_bin, weights=prices, minlength=T)
+    sum_qty = np.bincount(time_bin, weights=qtys, minlength=T)
+    sum_buy = np.bincount(time_bin, weights=is_buyer, minlength=T)
+    sum_px_qty = np.bincount(time_bin, weights=prices * qtys, minlength=T)
 
-    # Vectorized aggregates
-    for t in range(T):
-        mask = time_bin == t
-        if mask.sum() == 0:
-            if t > 0:
-                features[t] = features[t - 1]
-            continue
+    mean_price = np.divide(sum_price, counts, out=np.zeros(T, dtype=np.float64), where=active)
+    vwap = np.divide(sum_px_qty, sum_qty, out=np.zeros(T, dtype=np.float64), where=sum_qty > 0)
 
-        p = prices[mask]
-        q = qtys[mask]
-        b = is_buyer[mask]
-        n = len(p)
+    starts = np.flatnonzero(np.r_[True, time_bin[1:] != time_bin[:-1]])
+    bins = time_bin[starts]
+    ends = np.r_[starts[1:] - 1, len(time_bin) - 1]
 
-        mean_p = p.mean()
-        ret = np.log(p[-1] / p[0]) if p[0] > 0 else 0.0
+    first_price = np.zeros(T, dtype=np.float64)
+    last_price = np.zeros(T, dtype=np.float64)
+    first_price[bins] = prices[starts]
+    last_price[bins] = prices[ends]
 
-        features[t, 0] = np.clip(ret * 100, -5, 5)  # log return scaled
-        features[t, 1] = np.clip(np.log1p(q.sum()) / 10, 0, 5)  # log volume
-        features[t, 2] = b.mean() if n > 0 else 0.5  # buy ratio
-        features[t, 3] = np.clip(n / 100.0, 0, 5)  # trade count
-        features[t, 4] = np.clip(np.std(np.diff(np.log(p + 1e-10))) * 100 if n > 1 else 0, 0, 5)  # vol
-        vwap = (p * q).sum() / (q.sum() + 1e-10)
-        features[t, 5] = np.clip((vwap - mean_p) / (mean_p + 1e-10) * 1000, -5, 5)  # vwap dev
-        features[t, 6] = np.clip(np.log1p(q.max()) / 5, 0, 5)  # max trade size
-        features[t, 7] = 0  # momentum filled below
+    max_trade_size = np.zeros(T, dtype=np.float64)
+    np.maximum.at(max_trade_size, time_bin, qtys)
+
+    features[:, 0] = np.clip(
+        np.divide(
+            np.log(np.divide(last_price, first_price, out=np.ones(T), where=first_price > 0)),
+            1.0,
+            out=np.zeros(T),
+            where=first_price > 0,
+        ) * 100,
+        -5,
+        5,
+    )
+    features[:, 1] = np.clip(np.log1p(sum_qty) / 10, 0, 5)
+    features[:, 2] = np.divide(sum_buy, counts, out=np.full(T, 0.5, dtype=np.float64), where=active)
+    features[:, 3] = np.clip(counts / 100.0, 0, 5)
+
+    if len(prices) > 1:
+        log_prices = np.log(prices + 1e-10)
+        diff_bins_mask = time_bin[1:] == time_bin[:-1]
+        diff_bins = time_bin[1:][diff_bins_mask]
+        diff_vals = np.diff(log_prices)[diff_bins_mask]
+        if len(diff_vals) > 0:
+            diff_counts = np.bincount(diff_bins, minlength=T).astype(np.float64)
+            diff_sum = np.bincount(diff_bins, weights=diff_vals, minlength=T)
+            diff_sq_sum = np.bincount(diff_bins, weights=diff_vals * diff_vals, minlength=T)
+            diff_mean = np.divide(diff_sum, diff_counts, out=np.zeros(T), where=diff_counts > 0)
+            diff_var = np.divide(diff_sq_sum, diff_counts, out=np.zeros(T), where=diff_counts > 0) - diff_mean ** 2
+            features[:, 4] = np.clip(np.sqrt(np.clip(diff_var, 0, None)) * 100, 0, 5)
+
+    features[:, 5] = np.clip(
+        np.divide(vwap - mean_price, mean_price + 1e-10, out=np.zeros(T), where=active) * 1000,
+        -5,
+        5,
+    )
+    features[:, 6] = np.clip(np.log1p(max_trade_size) / 5, 0, 5)
+
+    features = _forward_fill_features(features, active)
 
     # Momentum (5-window cumulative return)
     cum_ret = np.cumsum(features[:, 0])
@@ -157,18 +207,19 @@ class BinanceMultiAssetDataset(Dataset):
             if not zips:
                 continue
 
-            dfs = []
+            feature_blocks = []
             for z in zips:
                 try:
-                    dfs.append(load_aggtrades_zip(z))
+                    block = aggregate_per_window(load_aggtrades_zip(z), window_seconds)
+                    if len(block) > 0:
+                        feature_blocks.append(block)
                 except Exception as e:
                     logger.warning("Failed to load %s: %s", z, e)
 
-            if not dfs:
+            if not feature_blocks:
                 continue
 
-            combined = pd.concat(dfs, ignore_index=True).sort_values("timestamp_s")
-            features = aggregate_per_window(combined, window_seconds)
+            features = np.concatenate(feature_blocks, axis=0)
 
             # Normalize per-feature
             mean = features.mean(axis=0, keepdims=True)

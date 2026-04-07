@@ -10,7 +10,7 @@ echo "============================================================"
 
 .venv/bin/python3 -u << 'PYEOF'
 import torch, torch.nn as nn, torch.nn.functional as F
-import numpy as np, logging
+import numpy as np, logging, os
 from pathlib import Path
 from tqdm import tqdm
 from agentdiffusion.models.video_dit import VideoDiT, VideoDDIMSampler
@@ -25,13 +25,14 @@ logger = logging.getLogger(__name__)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 OUT_DIR = Path("outputs/vdit_multi_asset")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+MAX_MONTHS = int(os.environ.get("MULTI_ASSET_MAX_MONTHS", "3"))
 
 # --- Dataset ---
 dataset = BinanceMultiAssetDataset(
     "data/external/binance/aggTrades",
     total_frames=20, cond_frames=4,
     window_seconds=60.0,  # 1-minute windows
-    max_months=3,
+    max_months=MAX_MONTHS,
 )
 logger.info("Dataset: %d sequences", len(dataset))
 
@@ -85,7 +86,7 @@ while step < TOTAL_STEPS:
         noise = torch.randn_like(z_gen)
         t_exp = t.unsqueeze(1).expand(B, N).reshape(B * N)
         z_noisy = scheduler.q_sample(
-            z_gen.reshape(B*N, H, W, C), noise.reshape(B*N, H, W, C), t_exp
+            z_gen.reshape(B*N, H, W, C), t_exp, noise.reshape(B*N, H, W, C)
         ).reshape(B, N, H, W, C)
 
         v_pred = model(z_cond, z_noisy, t)
