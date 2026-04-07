@@ -284,13 +284,21 @@ class NewsConditioner:
     # ------------------------------------------------------------------
 
     def _build_embeddings(self, max_features: int) -> None:
-        """Build d_news-dim embeddings from concatenated news titles per stock."""
+        """Build d_news-dim embeddings per stock.
+
+        Uses BERT if available (semantic understanding), falls back to TF-IDF+PCA.
+        """
         codes = sorted(self.stock_news.keys())
         if len(codes) == 0:
             self._embedding_map: dict[str, np.ndarray] = {}
             return
 
-        # One document per stock = all titles concatenated
+        # Try BERT first
+        if self._try_bert_embeddings(codes):
+            return
+
+        # Fallback: TF-IDF + PCA
+        logger.info("Using TF-IDF fallback for news embeddings")
         documents = []
         for code in codes:
             all_text = " ".join(self.stock_news[code])
@@ -301,13 +309,70 @@ class NewsConditioner:
         logger.info(
             "TF-IDF matrix: %d stocks x %d features", tfidf.shape[0], tfidf.shape[1],
         )
-
-        # PCA to d_news
-        reduced = _pca_reduce(tfidf, self.d_news)  # [n_stocks, d_news]
-
+        reduced = _pca_reduce(tfidf, self.d_news)
         self._embedding_map = {
             code: reduced[i] for i, code in enumerate(codes)
         }
+
+    def _try_bert_embeddings(self, codes: list[str]) -> bool:
+        """Try to build embeddings using Chinese BERT. Returns True if successful."""
+        try:
+            import os
+            import torch
+            from transformers import AutoTokenizer, AutoModel
+
+            hf_endpoint = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
+            os.environ["HF_ENDPOINT"] = hf_endpoint
+
+            model_name = "hfl/chinese-roberta-wwm-ext"
+            logger.info("Loading Chinese BERT: %s", model_name)
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModel.from_pretrained(model_name)
+            model.eval()
+
+            # Use GPU if available
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model = model.to(device)
+            logger.info("BERT on %s, encoding %d stocks...", device, len(codes))
+
+            all_embeddings = []
+            for i, code in enumerate(codes):
+                # Concatenate all news for this stock, truncate to 512 tokens
+                all_text = " ".join(self.stock_news[code])
+                inputs = tokenizer(
+                    all_text, return_tensors="pt",
+                    truncation=True, max_length=512, padding=True,
+                ).to(device)
+
+                with torch.no_grad():
+                    outputs = model(**inputs)
+                    # CLS token embedding
+                    cls_emb = outputs.last_hidden_state[:, 0, :].cpu().numpy()  # [1, 768]
+                all_embeddings.append(cls_emb[0])
+
+                if (i + 1) % 100 == 0:
+                    logger.info("  Encoded %d / %d stocks", i + 1, len(codes))
+
+            embeddings = np.stack(all_embeddings)  # [n_stocks, 768]
+            logger.info("BERT embeddings: %d stocks x %d dims", *embeddings.shape)
+
+            # PCA to d_news
+            reduced = _pca_reduce(embeddings, self.d_news)  # [n_stocks, d_news]
+            self._embedding_map = {
+                code: reduced[i] for i, code in enumerate(codes)
+            }
+
+            # Free BERT memory
+            del model, tokenizer
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            logger.info("BERT news embeddings ready: %d dims per stock", self.d_news)
+            return True
+
+        except Exception as e:
+            logger.warning("BERT embedding failed (%s), falling back to TF-IDF", e)
+            return False
 
     # ------------------------------------------------------------------
     # Internal: keyword-based sentiment
