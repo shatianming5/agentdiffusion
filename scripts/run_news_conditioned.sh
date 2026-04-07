@@ -78,10 +78,13 @@ if len(dataset) == 0:
 
 # ---- News Conditioner ----
 logger.info("Loading NewsConditioner from %s ...", NEWS_PATH)
+CONTENT_CSV = "data/external/news/news_20240619_with_content.csv"
 news_cond = NewsConditioner(
     news_excel_path=NEWS_PATH,
     target_date=TARGET_DATE,
     d_news=NEWS_DIM,
+    content_csv_path=CONTENT_CSV,
+    use_content=True,
 )
 
 # Print news summary
@@ -449,10 +452,13 @@ if len(dataset) == 0:
     logger.error("No data!"); import sys; sys.exit(1)
 
 # ---- News conditioner (original + flipped copy) ----
+CONTENT_CSV = "data/external/news/news_20240619_with_content.csv"
 news_cond = NewsConditioner(
     news_excel_path=NEWS_PATH,
     target_date=TARGET_DATE,
     d_news=NEWS_DIM,
+    content_csv_path=CONTENT_CSV,
+    use_content=True,
 )
 
 news_embeddings = news_cond.get_stock_embeddings(dataset.stock_codes)  # [100, 32]

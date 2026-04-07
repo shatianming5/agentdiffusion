@@ -153,9 +153,13 @@ class NewsConditioner:
         target_date: str = "2024-06-19",
         d_news: int = D_NEWS,
         max_tfidf_features: int = 2000,
+        content_csv_path: str | Path | None = None,
+        use_content: bool = True,
     ):
         self.d_news = d_news
         self.news_excel_path = Path(news_excel_path)
+        self.content_csv_path = Path(content_csv_path) if content_csv_path else None
+        self.use_content = use_content
         self.target_date_str = target_date.replace("-", "")  # -> '20240619'
 
         # Detect jieba availability once
@@ -237,8 +241,20 @@ class NewsConditioner:
             day_df["Symbol"].nunique() if "Symbol" in day_df.columns else 0,
         )
 
+        # Try to load full content from CSV if available
+        content_map = {}  # NewsID -> content string
+        if self.use_content and self.content_csv_path and self.content_csv_path.exists():
+            import pandas as _pd2
+            cdf = _pd2.read_csv(self.content_csv_path)
+            for _, cr in cdf.iterrows():
+                nid = cr.get("NewsID")
+                content = str(cr.get("Content", ""))
+                if nid and content and content != "nan":
+                    content_map[int(nid)] = content
+            logger.info("Loaded %d news articles with full content", len(content_map))
+
         # Group by normalised stock code
-        self.stock_news = {}       # code -> [title, ...]
+        self.stock_news = {}       # code -> [text, ...] (title or title+content)
         self.stock_full_dates = {} # code -> [FullDeclareDate, ...]
 
         for _, row in day_df.iterrows():
@@ -249,7 +265,18 @@ class NewsConditioner:
             if not code or not title:
                 continue
 
-            self.stock_news.setdefault(code, []).append(title)
+            # Use full content if available, otherwise title only
+            nid = row.get("NewsID")
+            try:
+                nid = int(nid)
+            except (TypeError, ValueError):
+                nid = None
+            if nid and nid in content_map:
+                text = title + " " + content_map[nid]
+            else:
+                text = title
+
+            self.stock_news.setdefault(code, []).append(text)
             self.stock_full_dates.setdefault(code, []).append(full_dt)
 
     # ------------------------------------------------------------------
