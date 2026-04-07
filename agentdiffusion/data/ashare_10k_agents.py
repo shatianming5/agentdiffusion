@@ -275,7 +275,7 @@ def build_agent_grid(
 
 
 class AShare10KAgentDataset(Dataset):
-    """A-Share L3 data with 10K agent clusters on 100×100 grid.
+    """A-Share L3 data with configurable agent clusters on an H x W grid.
 
     Args:
         data_dir: directory containing stock subdirectories
@@ -284,6 +284,8 @@ class AShare10KAgentDataset(Dataset):
         window_seconds: aggregation window
         max_stocks: number of stocks to pool
         n_clusters: number of agent clusters (default 10000)
+        grid_h: grid height (default GRID_H=100)
+        grid_w: grid width (default GRID_W=100)
     """
 
     def __init__(
@@ -294,6 +296,8 @@ class AShare10KAgentDataset(Dataset):
         window_seconds: float = 5.0,
         max_stocks: int = 30,
         n_clusters: int = N_CLUSTERS,
+        grid_h: int = GRID_H,
+        grid_w: int = GRID_W,
     ):
         self.total_frames = total_frames
         self.cond_frames = cond_frames
@@ -309,11 +313,11 @@ class AShare10KAgentDataset(Dataset):
         logger.info("Extracting order features...")
         features = extract_order_features(orders)
 
-        # Step 3: Cluster into 10K agents
+        # Step 3: Cluster into K agents
         labels, centers = cluster_agents(features, n_clusters)
 
-        # Step 4: Arrange on 100×100 grid
-        H, W = GRID_H, GRID_W
+        # Step 4: Arrange on grid_h x grid_w grid
+        H, W = grid_h, grid_w
         logger.info("Arranging %d clusters on %dx%d grid...", n_clusters, H, W)
         grid_pos = arrange_grid_2d(centers, H, W)
 
@@ -338,8 +342,8 @@ class AShare10KAgentDataset(Dataset):
             self.all_sequences.append(torch.from_numpy(seq).float())
 
         logger.info(
-            "AShare10KAgentDataset: %d stocks, %d clusters, %d windows → %d sequences",
-            max_stocks, n_clusters, T_total, len(self.all_sequences),
+            "AShare10KAgentDataset: %d stocks, %d clusters, %dx%d grid, %d windows -> %d sequences",
+            max_stocks, n_clusters, H, W, T_total, len(self.all_sequences),
         )
 
     def __len__(self) -> int:
