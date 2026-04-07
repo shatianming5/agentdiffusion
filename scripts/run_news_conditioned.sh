@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 export PYTHONPATH=$PWD:${PYTHONPATH:-}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2}
 
 echo "============================================================"
 echo "  News-Conditioned Rich Agent Video DiT"
@@ -125,8 +125,8 @@ encoder = RichAgentEncoder(
 # Video DiT: d_latent=200, 10x10 grid, market_cond_dim=40 (8 + 32 news)
 dit = VideoDiT(
     d_latent=D_LATENT,
-    d_model=512,
-    depth=8,
+    d_model=256,
+    depth=4,
     heads=8,
     patch_size=2,
     num_frames=TOTAL_FRAMES,
@@ -157,6 +157,12 @@ logger.info("DiT params: %.2fM", n_dit / 1e6)
 logger.info("Decoder params: %.2fM", n_dec / 1e6)
 logger.info("Total params: %.2fM", (n_enc + n_dit + n_dec) / 1e6)
 
+# Multi-GPU DataParallel (only DiT — encoder/decoder use custom methods)
+n_gpus = torch.cuda.device_count()
+if n_gpus > 1:
+    logger.info("Using %d GPUs with DataParallel (DiT only)", n_gpus)
+    dit = torch.nn.DataParallel(dit)
+
 # ---- Optimizer + scheduler ----
 all_params = (
     list(encoder.parameters())
@@ -178,17 +184,23 @@ order_loss_fn = RichOrderLoss(
 )
 
 # ---- EMA ----
-ema_dit = {k: v.clone() for k, v in dit.state_dict().items()}
-ema_enc = {k: v.clone() for k, v in encoder.state_dict().items()}
-ema_dec = {k: v.clone() for k, v in decoder.state_dict().items()}
+def _unwrap(model):
+    return model.module if hasattr(model, 'module') else model
+
+ema_dit = {k: v.clone() for k, v in _unwrap(dit).state_dict().items()}
+ema_enc = {k: v.clone() for k, v in _unwrap(encoder).state_dict().items()}
+ema_dec = {k: v.clone() for k, v in _unwrap(decoder).state_dict().items()}
 
 def update_ema():
+    dit_sd = _unwrap(dit).state_dict()
+    enc_sd = _unwrap(encoder).state_dict()
+    dec_sd = _unwrap(decoder).state_dict()
     with torch.no_grad():
-        for k, v in dit.state_dict().items():
+        for k, v in dit_sd.items():
             ema_dit[k].lerp_(v, 1 - EMA_DECAY)
-        for k, v in encoder.state_dict().items():
+        for k, v in enc_sd.items():
             ema_enc[k].lerp_(v, 1 - EMA_DECAY)
-        for k, v in decoder.state_dict().items():
+        for k, v in dec_sd.items():
             ema_dec[k].lerp_(v, 1 - EMA_DECAY)
 
 
