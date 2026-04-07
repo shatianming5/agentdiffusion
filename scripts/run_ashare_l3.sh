@@ -153,7 +153,8 @@ while step < TOTAL_STEPS:
             torch.cat([z_cond[:, -1:], z0_pred], dim=1))
         with torch.no_grad():
             gt_orders = order_decoder.decode_sequence(frames[:, K-1:])
-        loss_order = F.mse_loss(pred_orders, gt_orders)
+        gt_scale = gt_orders.detach().abs().mean().clamp(min=1e-4)
+        loss_order = F.mse_loss(pred_orders / gt_scale, gt_orders / gt_scale)
 
         loss = loss_diff + LAMBDA_ORDER * loss_order
 
