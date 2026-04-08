@@ -265,7 +265,15 @@ dit.eval()
 from agentdiffusion.models.video_dit import VideoDDIMSampler
 from agentdiffusion.infer.interactive_sim import InteractiveSimulator
 sampler = VideoDDIMSampler(_unwrap(dit), noise_sched, "v_prediction", ddim_steps=20, eta=0.0)
-sim = InteractiveSimulator(_unwrap(dit), sampler, num_cond=K, num_gen=T-K, zero_sum_proj=True)
+sim = InteractiveSimulator(
+    _unwrap(dit),
+    sampler,
+    num_cond=K,
+    num_gen=T-K,
+    zero_sum_proj=True,
+    market_cond=build_mc(1),
+    anchor_state_stats=True,
+)
 seed = all_encoded[0][:K].to(device)
 sim.init(seed)
 for r in range(5):

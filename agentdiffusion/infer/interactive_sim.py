@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from ..models.video_dit import VideoDiT, VideoDDIMSampler
 from ..diffusion.scheduler import NoiseScheduler
 
@@ -39,6 +40,10 @@ class InteractiveSimulator:
         recalibrate_every: int = 0,
         recalibrate_strength: float = 0.3,
         scheduler: NoiseScheduler | None = None,
+        market_cond: torch.Tensor | None = None,
+        anchor_state_stats: bool = False,
+        target_state_mean: torch.Tensor | float | None = None,
+        target_state_std: torch.Tensor | float | None = None,
     ):
         self.model = model
         self.sampler = sampler
@@ -53,6 +58,12 @@ class InteractiveSimulator:
         self.scheduler = scheduler
 
         self.device = next(model.parameters()).device
+        if market_cond is not None and market_cond.dim() == 1:
+            market_cond = market_cond.unsqueeze(0)
+        self.market_cond = market_cond.to(self.device) if market_cond is not None else None
+        self.anchor_state_stats = anchor_state_stats
+        self.target_state_mean = self._to_device_scalar(target_state_mean)
+        self.target_state_std = self._to_device_scalar(target_state_std)
         self.buffer: torch.Tensor | None = None  # [1, T_buf, H, W, d_state]
         self.total_steps = 0
 
@@ -65,7 +76,47 @@ class InteractiveSimulator:
         if initial_frames.dim() == 4:
             initial_frames = initial_frames.unsqueeze(0)
         self.buffer = initial_frames.to(self.device)
+        self._init_anchor_state_stats(self.buffer)
         self.total_steps = 0
+
+    def _to_device_scalar(self, value: torch.Tensor | float | None) -> torch.Tensor | None:
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return value.detach().to(self.device)
+        return torch.tensor(float(value), device=self.device)
+
+    def _init_anchor_state_stats(self, frames: torch.Tensor) -> None:
+        if not self.anchor_state_stats:
+            return
+        if self.target_state_mean is None:
+            self.target_state_mean = frames.mean(dim=-1).mean().detach()
+        if self.target_state_std is None:
+            self.target_state_std = frames.std(dim=-1).mean().detach().clamp(min=1e-6)
+
+    def _apply_zero_sum_projection(self, frames: torch.Tensor) -> torch.Tensor:
+        if not self.zero_sum_proj:
+            return frames
+        pos = frames[..., 0]
+        if self.valid_mask is not None:
+            vm = self.valid_mask.to(pos.device)
+            n_valid = vm.sum().float().clamp(min=1)
+            net = (pos * vm).sum(dim=(-2, -1), keepdim=True) / n_valid
+            frames[..., 0] = pos - net * vm
+        else:
+            net = pos.mean(dim=(-2, -1), keepdim=True)
+            frames[..., 0] = pos - net
+        return frames
+
+    def _anchor_generated_states(self, generated: torch.Tensor) -> torch.Tensor:
+        if not self.anchor_state_stats:
+            return generated
+        assert self.target_state_mean is not None and self.target_state_std is not None
+        # Keep autoregressive rollouts on the encoder's latent manifold by
+        # matching the per-cell feature statistics of the initial seed states.
+        anchored = F.layer_norm(generated, (generated.shape[-1],))
+        anchored = anchored * self.target_state_std + self.target_state_mean
+        return self._apply_zero_sum_projection(anchored)
 
     @property
     def current_frames(self) -> torch.Tensor:
@@ -94,10 +145,11 @@ class InteractiveSimulator:
 
         with torch.no_grad():
             generated = self.sampler.sample(
-                x_cond, gen_shape, device=self.device,
+                x_cond, gen_shape, market_cond=self.market_cond, device=self.device,
                 zero_sum_proj=self.zero_sum_proj,
                 valid_mask=self.valid_mask,
             )  # [1, N, H, W, D]
+            generated = self._anchor_generated_states(generated)
 
         # Append to buffer (keep rolling)
         self.buffer = torch.cat([self.buffer, generated], dim=1)
@@ -133,10 +185,11 @@ class InteractiveSimulator:
             gen_shape = (B, T, H, W, D)
             # Quick denoise: just run a few DDIM steps from the noisy state
             denoised = self.sampler.sample(
-                x_cond, gen_shape, device=self.device,
+                x_cond, gen_shape, market_cond=self.market_cond, device=self.device,
                 zero_sum_proj=self.zero_sum_proj,
                 valid_mask=self.valid_mask,
             )
+            denoised = self._anchor_generated_states(denoised)
         # Replace tail with denoised version
         self.buffer[:, -K:] = denoised[:, :K]
 
