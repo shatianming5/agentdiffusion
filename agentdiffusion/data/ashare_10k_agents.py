@@ -14,8 +14,8 @@ tech stocks") that persists across time and has evolving state.
 
 from __future__ import annotations
 
+import hashlib
 import logging
-import math
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +28,33 @@ logger = logging.getLogger(__name__)
 N_CLUSTERS = 10000
 GRID_H, GRID_W = 100, 100
 D_STATE = 6
+MARKET_COND_DIM = 32
+
+
+def _dataset_cache_path(
+    data_dir: str | Path,
+    total_frames: int,
+    cond_frames: int,
+    window_seconds: float,
+    max_stocks: int,
+    n_clusters: int,
+    grid_h: int,
+    grid_w: int,
+    cache_dir: str | Path,
+) -> Path:
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    data_tag = str(Path(data_dir).resolve())
+    key = (
+        f"{data_tag}|tf={total_frames}|cf={cond_frames}|ws={window_seconds}|"
+        f"stocks={max_stocks}|k={n_clusters}|gh={grid_h}|gw={grid_w}"
+    )
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+    name = (
+        f"{Path(data_dir).name}_tf{total_frames}_cf{cond_frames}_ws{window_seconds:g}_"
+        f"stocks{max_stocks}_k{n_clusters}_{grid_h}x{grid_w}_{digest}.pt"
+    )
+    return cache_dir / name
 
 
 def load_orders_multi_stock(
@@ -298,14 +325,42 @@ class AShare10KAgentDataset(Dataset):
         n_clusters: int = N_CLUSTERS,
         grid_h: int = GRID_H,
         grid_w: int = GRID_W,
+        cache_dir: str | Path = "outputs/cache/ashare_10k_agents",
+        use_cache: bool = True,
     ):
         self.total_frames = total_frames
         self.cond_frames = cond_frames
+        self.grid_h = grid_h
+        self.grid_w = grid_w
+        self.market_conds = torch.zeros(self.total_frames, MARKET_COND_DIM)
+        self.grid = torch.empty(0, grid_h, grid_w, D_STATE, dtype=torch.float16)
+        self.sequence_starts: list[int] = []
+        self.cache_path = _dataset_cache_path(
+            data_dir,
+            total_frames,
+            cond_frames,
+            window_seconds,
+            max_stocks,
+            n_clusters,
+            grid_h,
+            grid_w,
+            cache_dir,
+        )
+
+        if use_cache and self.cache_path.exists():
+            logger.info("Loading cached 10K agent grid from %s", self.cache_path)
+            cached = torch.load(self.cache_path, map_location="cpu", weights_only=False)
+            self.grid = cached["grid"]
+            self.sequence_starts = list(cached["sequence_starts"])
+            logger.info(
+                "Loaded cached grid: shape=%s, sequences=%d",
+                tuple(self.grid.shape), len(self.sequence_starts),
+            )
+            return
 
         # Step 1: Load pooled orders
         orders = load_orders_multi_stock(data_dir, max_stocks)
         if orders.empty:
-            self.all_sequences = []
             logger.error("No orders loaded!")
             return
 
@@ -334,23 +389,42 @@ class AShare10KAgentDataset(Dataset):
         std = flat.std(axis=0, keepdims=True).clip(min=1e-8)
         grid = ((grid - mean) / std).clip(-5, 5)
 
-        # Split into sequences
-        self.all_sequences = []
-        stride = total_frames // 2
-        for i in range(0, T_total - total_frames + 1, stride):
-            seq = grid[i:i + total_frames]
-            self.all_sequences.append(torch.from_numpy(seq).float())
+        # Cache/store the normalized temporal grid; slice into sequences on demand.
+        self.grid = torch.from_numpy(grid).to(torch.float16)
+        stride = max(total_frames // 2, 1)
+        self.sequence_starts = list(range(0, T_total - total_frames + 1, stride))
 
         logger.info(
             "AShare10KAgentDataset: %d stocks, %d clusters, %dx%d grid, %d windows -> %d sequences",
-            max_stocks, n_clusters, H, W, T_total, len(self.all_sequences),
+            max_stocks, n_clusters, H, W, T_total, len(self.sequence_starts),
         )
+        if use_cache:
+            torch.save(
+                {
+                    "grid": self.grid,
+                    "sequence_starts": self.sequence_starts,
+                    "config": {
+                        "data_dir": str(data_dir),
+                        "total_frames": total_frames,
+                        "cond_frames": cond_frames,
+                        "window_seconds": window_seconds,
+                        "max_stocks": max_stocks,
+                        "n_clusters": n_clusters,
+                        "grid_h": grid_h,
+                        "grid_w": grid_w,
+                    },
+                },
+                self.cache_path,
+            )
+            logger.info("Saved cached 10K agent grid to %s", self.cache_path)
 
     def __len__(self) -> int:
-        return len(self.all_sequences)
+        return len(self.sequence_starts)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        start = self.sequence_starts[idx]
+        frames = self.grid[start:start + self.total_frames].float()
         return {
-            "frames": self.all_sequences[idx],
-            "market_conds": torch.zeros(self.total_frames, 32),
+            "frames": frames,
+            "market_conds": self.market_conds.clone(),
         }
