@@ -45,7 +45,13 @@ ALLOW_RANDOM_ENCODER = os.environ.get("ALLOW_RANDOM_ENCODER", "").lower() in {"1
 # Phase 1: Load E2E checkpoint encoder, pre-compute all states
 # ============================================================
 E2E_DIR = Path("outputs/vdit_rich_e2e")
-e2e_ckpts = sorted(E2E_DIR.glob("rich_e2e_step_*.pt"))
+def checkpoint_step(path: Path) -> int:
+    try:
+        return int(path.stem.rsplit("_step_", 1)[1])
+    except (IndexError, ValueError):
+        return -1
+
+e2e_ckpts = sorted(E2E_DIR.glob("rich_e2e_step_*.pt"), key=checkpoint_step)
 encoder_source = "random"
 encoder_cache_tag = "random_encoder"
 
