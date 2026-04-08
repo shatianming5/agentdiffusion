@@ -8,6 +8,7 @@ export HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
 echo "============================================================"
 echo "  Rich Agent Stage 2: Pre-compute encoder → fast DiT training"
 echo "  Runs AFTER run_rich_e2e.sh completes"
+echo "  Set ALLOW_RANDOM_ENCODER=1 only for ablations/debug runs"
 echo "============================================================"
 
 .venv/bin/python3 -u << 'PYEOF'
@@ -38,16 +39,19 @@ OUT_DIR = Path("outputs/vdit_rich_stage2")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR = Path("outputs/rich_encoder_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+ALLOW_RANDOM_ENCODER = os.environ.get("ALLOW_RANDOM_ENCODER", "").lower() in {"1", "true", "yes"}
 
 # ============================================================
 # Phase 1: Load E2E checkpoint encoder, pre-compute all states
 # ============================================================
 E2E_DIR = Path("outputs/vdit_rich_e2e")
 e2e_ckpts = sorted(E2E_DIR.glob("rich_e2e_step_*.pt"))
+encoder_source = "random"
+encoder_cache_tag = "random_encoder"
 
 from agentdiffusion.models.rich_agent_encoder import RichAgentEncoder
 
-# Load or train encoder
+# Load E2E encoder unless this is an explicit random-encoder ablation.
 if e2e_ckpts:
     logger.info("Loading trained encoder from %s", e2e_ckpts[-1])
     ckpt = torch.load(str(e2e_ckpts[-1]), map_location="cpu", weights_only=True)
@@ -58,8 +62,16 @@ if e2e_ckpts:
     enc_state = ckpt.get("ema_enc", ckpt.get("encoder"))
     encoder.load_state_dict(enc_state)
     logger.info("Encoder loaded (trained)")
+    encoder_source = "trained"
+    encoder_cache_tag = e2e_ckpts[-1].stem
 else:
-    logger.warning("No E2E checkpoint found, using random encoder")
+    if not ALLOW_RANDOM_ENCODER:
+        raise RuntimeError(
+            "No E2E checkpoint found in outputs/vdit_rich_e2e. "
+            "Run scripts/run_rich_e2e.sh first, or set ALLOW_RANDOM_ENCODER=1 "
+            "for an explicit random-encoder ablation."
+        )
+    logger.warning("No E2E checkpoint found, using random encoder (ALLOW_RANDOM_ENCODER=1)")
     encoder = RichAgentEncoder(
         d_raw_order=10, d_embed=64, d_state=D_LATENT,
         n_heads=4, n_layers=2, n_max_orders=N_MAX_ORDERS, dropout=0.0,
@@ -70,7 +82,11 @@ encoder = encoder.to(device).eval()
 # Load dataset (100 stocks now)
 from agentdiffusion.data.ashare_rich_agent_dataset import AShareRichAgentDataset
 
-cache_file = CACHE_DIR / f"encoded_states_{MAX_STOCKS}stocks_{D_LATENT}d.pt"
+cache_file = CACHE_DIR / (
+    f"encoded_states_{MAX_STOCKS}stocks_{D_LATENT}d_{encoder_cache_tag}.pt"
+)
+logger.info("Encoder source: %s", encoder_source)
+logger.info("Encoded-state cache: %s", cache_file)
 
 if cache_file.exists():
     logger.info("Loading cached encoded states from %s", cache_file)
@@ -99,7 +115,11 @@ else:
             states = states.reshape(T, GRID_H, GRID_W, D_LATENT).cpu()
             all_encoded.append(states)
 
-    torch.save({"states": all_encoded}, str(cache_file))
+    torch.save({
+        "states": all_encoded,
+        "encoder_source": encoder_source,
+        "encoder_cache_tag": encoder_cache_tag,
+    }, str(cache_file))
     logger.info("Saved %d encoded sequences to %s", len(all_encoded), cache_file)
 
 # Build simple dataset from pre-computed states
