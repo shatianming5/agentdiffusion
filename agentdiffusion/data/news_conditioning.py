@@ -1,15 +1,15 @@
 """News conditioning module for Rich Agent system.
 
 Loads financial news from 2024_News_Security.xlsx, computes per-stock
-text embeddings (TF-IDF + PCA, 32-dim) and keyword-based sentiment
-scores, and provides conditioning tensors for the Video DiT pipeline.
+text embeddings (TF-IDF + PCA or BERT, 32-dim) and keyword-based
+sentiment scores, and provides conditioning tensors for the Video DiT
+pipeline.
 
-News conditioning is STATIC per day: every time window in the same
-trading day receives the same news embedding. It is concatenated
-to the 8-dim market_cond to form a 40-dim conditioning vector.
-
-Stocks absent from the news dataset receive zero vectors, which the
-model learns to interpret as "no news = neutral".
+Two levels of conditioning are supported:
+1. Daily per-stock embeddings via ``get_stock_embeddings``.
+2. Time-varying per-stock embeddings via
+   ``get_stock_time_series_embeddings``, where only articles published
+   up to each window edge are visible.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 D_NEWS = 32  # output embedding dimension
+OPEN_SEC = 34200.0
 
 POSITIVE_KEYWORDS = ["涨", "利好", "增长", "突破", "新高", "盈利", "分红"]
 NEGATIVE_KEYWORDS = ["跌", "利空", "下跌", "爆雷", "退市", "亏损", "减持", "停产"]
@@ -58,6 +59,26 @@ def _tokenise(text: str, use_jieba: bool = False) -> list[str]:
             pass
     # Character-level fallback (skip ASCII punctuation / spaces)
     return [ch for ch in text if "\u4e00" <= ch <= "\u9fff"]
+
+
+def _parse_publish_seconds(raw_dt: str, fallback_date: str) -> float:
+    """Parse publish datetime to seconds since midnight for the target day.
+
+    If the timestamp is missing or unparsable, fall back to market open so the
+    article is visible for the whole trading day rather than being discarded.
+    """
+    import pandas as pd
+
+    value = str(raw_dt or "").strip()
+    if not value or value.lower() == "nan":
+        value = str(fallback_date or "").strip()
+    if not value or value.lower() == "nan":
+        return OPEN_SEC
+
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return OPEN_SEC
+    return float(ts.hour * 3600 + ts.minute * 60 + ts.second + ts.microsecond / 1e6)
 
 
 def _build_tfidf_matrix(
@@ -178,6 +199,7 @@ class NewsConditioner:
 
         # Build embeddings
         self._build_embeddings(max_tfidf_features)
+        self._article_embeddings_built = False
 
         # Compute sentiment
         self._compute_sentiment()
@@ -202,6 +224,7 @@ class NewsConditioner:
             )
             self.stock_news: dict[str, list[str]] = {}
             self.stock_full_dates: dict[str, list[str]] = {}
+            self.stock_articles: dict[str, list[tuple[float, str]]] = {}
             return
 
         logger.info("Loading news from %s ...", self.news_excel_path)
@@ -256,6 +279,7 @@ class NewsConditioner:
         # Group by normalised stock code
         self.stock_news = {}       # code -> [text, ...] (title or title+content)
         self.stock_full_dates = {} # code -> [FullDeclareDate, ...]
+        self.stock_articles = {}   # code -> [(publish_seconds, text), ...]
 
         for _, row in day_df.iterrows():
             code = _normalise_stock_code(str(row.get("Symbol", "")))
@@ -278,6 +302,8 @@ class NewsConditioner:
 
             self.stock_news.setdefault(code, []).append(text)
             self.stock_full_dates.setdefault(code, []).append(full_dt)
+            publish_sec = _parse_publish_seconds(full_dt, row.get("DeclareDate", ""))
+            self.stock_articles.setdefault(code, []).append((publish_sec, text))
 
     # ------------------------------------------------------------------
     # Internal: text embedding via TF-IDF + PCA
@@ -396,6 +422,43 @@ class NewsConditioner:
             score = (pos_count - neg_count) / max(total, 1)
             self.sentiment_map[code] = score
 
+    def _ensure_article_embeddings(self, max_features: int = 2000) -> None:
+        """Build per-article embeddings lazily for time-varying conditioning."""
+        if self._article_embeddings_built:
+            return
+
+        self._article_seconds_map: dict[str, np.ndarray] = {}
+        self._article_embedding_map: dict[str, np.ndarray] = {}
+
+        article_meta: list[tuple[str, float]] = []
+        documents: list[list[str]] = []
+        for code, items in self.stock_articles.items():
+            for publish_sec, text in items:
+                article_meta.append((code, float(publish_sec)))
+                documents.append(_tokenise(text, use_jieba=self._use_jieba))
+
+        if not documents:
+            self._article_embeddings_built = True
+            return
+
+        tfidf, _ = _build_tfidf_matrix(documents, max_features=max_features)
+        reduced = _pca_reduce(tfidf, self.d_news)
+
+        tmp_seconds: dict[str, list[float]] = {}
+        tmp_embeddings: dict[str, list[np.ndarray]] = {}
+        for (code, publish_sec), emb in zip(article_meta, reduced, strict=False):
+            tmp_seconds.setdefault(code, []).append(publish_sec)
+            tmp_embeddings.setdefault(code, []).append(np.asarray(emb, dtype=np.float32))
+
+        for code, secs in tmp_seconds.items():
+            order = np.argsort(np.asarray(secs, dtype=np.float32))
+            sec_arr = np.asarray(secs, dtype=np.float32)[order]
+            emb_arr = np.stack(tmp_embeddings[code], axis=0).astype(np.float32)[order]
+            self._article_seconds_map[code] = sec_arr
+            self._article_embedding_map[code] = emb_arr
+
+        self._article_embeddings_built = True
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -425,6 +488,51 @@ class NewsConditioner:
         for i, raw_code in enumerate(stock_codes):
             code = _normalise_stock_code(raw_code)
             result[i] = self.sentiment_map.get(code, 0.0)
+        return result
+
+    def get_stock_time_series_embeddings(
+        self,
+        stock_codes: list[str],
+        time_edges: np.ndarray,
+        cumulative: bool = True,
+    ) -> np.ndarray:
+        """Return time-varying [T, n_stocks, d_news] news embeddings.
+
+        For each stock and each window ``t``, only articles whose publish time
+        is earlier than ``time_edges[t + 1]`` are visible.
+        """
+        self._ensure_article_embeddings()
+
+        T = max(len(time_edges) - 1, 0)
+        n = len(stock_codes)
+        result = np.zeros((T, n, self.d_news), dtype=np.float32)
+        if T == 0 or n == 0:
+            return result
+
+        window_starts = np.asarray(time_edges[:-1], dtype=np.float32)
+        window_ends = np.asarray(time_edges[1:], dtype=np.float32)
+
+        for i, raw_code in enumerate(stock_codes):
+            code = _normalise_stock_code(raw_code)
+            secs = self._article_seconds_map.get(code)
+            embs = self._article_embedding_map.get(code)
+            if secs is None or embs is None or len(secs) == 0:
+                continue
+
+            if cumulative:
+                cumsum = np.cumsum(embs, axis=0)
+                counts = np.searchsorted(secs, window_ends, side="right")
+                valid = counts > 0
+                if valid.any():
+                    result[valid, i] = cumsum[counts[valid] - 1] / counts[valid, None]
+                continue
+
+            left = np.searchsorted(secs, window_starts, side="left")
+            right = np.searchsorted(secs, window_ends, side="right")
+            for t in range(T):
+                if right[t] > left[t]:
+                    result[t, i] = embs[left[t]:right[t]].mean(axis=0)
+
         return result
 
     def get_grid_conditioning(

@@ -283,7 +283,7 @@ class VideoConditionEmbedding(nn.Module):
         """
         Args:
             t: [B] diffusion timestep.
-            market_cond: [B, market_cond_dim] optional market conditions.
+            market_cond: [B, market_cond_dim] optional global market conditions.
         Returns:
             [B, d_model] conditioning vector.
         """
@@ -364,7 +364,14 @@ class VideoDiT(nn.Module):
         nn.init.trunc_normal_(self.frame_type_embed.weight, std=0.02)
 
         # --- Conditioning (diffusion timestep + optional market cond) ---
+        self.market_cond_dim = market_cond_dim
         self.cond_embed = VideoConditionEmbedding(d_model, market_cond_dim)
+        self.frame_cond_proj = nn.Sequential(
+            nn.Linear(market_cond_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.grid_cond_patchify = Patchify(patch_size, market_cond_dim, d_model)
 
         # --- Transformer blocks ---
         self.blocks = nn.ModuleList([
@@ -404,6 +411,46 @@ class VideoDiT(nn.Module):
         tokens = self.patchify(flat)                  # [B*T, Np, d_model]
         return tokens.reshape(B, T, self.num_patches, self.d_model)
 
+    def _summarize_market_cond(self, market_cond: torch.Tensor | None) -> torch.Tensor | None:
+        if market_cond is None:
+            return None
+        if market_cond.dim() == 2:
+            return market_cond
+        if market_cond.dim() == 3:
+            return market_cond.mean(dim=1)
+        if market_cond.dim() == 5:
+            return market_cond.mean(dim=(1, 2, 3))
+        raise ValueError(f"Unsupported market_cond rank: {market_cond.dim()}")
+
+    def _tokenise_market_cond(
+        self,
+        market_cond: torch.Tensor | None,
+        T: int,
+    ) -> torch.Tensor | None:
+        if market_cond is None:
+            return None
+        if market_cond.dim() == 2:
+            return None
+        if market_cond.dim() == 3:
+            if market_cond.shape[1] != T or market_cond.shape[2] != self.market_cond_dim:
+                raise ValueError(
+                    f"Expected market_cond shape [B, {T}, {self.market_cond_dim}], "
+                    f"got {tuple(market_cond.shape)}"
+                )
+            return self.frame_cond_proj(market_cond).unsqueeze(2)
+        if market_cond.dim() == 5:
+            B, Tm, H, W, C = market_cond.shape
+            if Tm != T or H != self.grid_h or W != self.grid_w or C != self.market_cond_dim:
+                raise ValueError(
+                    "Expected market_cond shape "
+                    f"[B, {T}, {self.grid_h}, {self.grid_w}, {self.market_cond_dim}], "
+                    f"got {tuple(market_cond.shape)}"
+                )
+            flat = market_cond.reshape(B * Tm, H, W, C)
+            cond_tokens = self.grid_cond_patchify(flat)
+            return cond_tokens.reshape(B, Tm, self.num_patches, self.d_model)
+        raise ValueError(f"Unsupported market_cond rank: {market_cond.dim()}")
+
     def forward(
         self,
         x_cond: torch.Tensor,
@@ -417,7 +464,10 @@ class VideoDiT(nn.Module):
             x_cond:  [B, K, H, W, d_latent] -- K clean condition frames.
             x_noisy: [B, N, H, W, d_latent] -- N noised generation frames.
             t:       [B] -- diffusion timestep.
-            market_cond: [B, market_cond_dim] -- optional market conditions.
+            market_cond:
+                - [B, C] global conditioning
+                - [B, T, C] frame-wise conditioning
+                - [B, T, H, W, C] cell-level conditioning grid
 
         Returns:
             [B, N, H, W, d_latent] -- predicted v for generation frames only.
@@ -439,6 +489,11 @@ class VideoDiT(nn.Module):
         # temporal_pos_embed: [1, T, D] -> [1, T, 1, D] broadcast over Np
         tokens = tokens + self.temporal_pos_embed[:, :T].unsqueeze(2)
 
+        # --- Add optional frame-wise / spatial conditioning tokens ---
+        token_cond = self._tokenise_market_cond(market_cond, T)
+        if token_cond is not None:
+            tokens = tokens + token_cond
+
         # --- Add frame type embedding ---
         # frame_types: 0 for condition, 1 for generation
         frame_types = torch.cat([
@@ -452,7 +507,7 @@ class VideoDiT(nn.Module):
         x = rearrange(tokens, "b t n d -> b (t n) d")
 
         # --- Conditioning vector ---
-        c = self.cond_embed(t, market_cond)  # [B, D]
+        c = self.cond_embed(t, self._summarize_market_cond(market_cond))  # [B, D]
 
         # --- Transformer blocks ---
         for block in self.blocks:
