@@ -22,9 +22,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from agentdiffusion.data.news_conditioning import NewsConditioner
+from agentdiffusion.data.ashare_10k_rich_orders import AShare10KRichOrderDataset
 from agentdiffusion.diffusion.scheduler import NoiseScheduler
 from agentdiffusion.infer.interactive_sim import InteractiveSimulator
+from agentdiffusion.models.rich_order_decoder import RichOrderDecoder, RichOrderLoss
 from agentdiffusion.models.video_dit import VideoDDIMSampler, VideoDiT
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -58,43 +59,62 @@ def latest_checkpoint(out_dir: Path) -> Path | None:
     return ckpts[-1] if ckpts else None
 
 
-def build_news_mean(stock_codes: list[str], device: torch.device, d_news: int) -> torch.Tensor:
-    news_path = Path("data/external/news/2024_News_Security.xlsx")
-    content_csv = Path("data/external/news/news_20240619_with_content.csv")
-    if not news_path.exists():
-        logger.warning("News file missing: %s", news_path)
-        return torch.zeros(d_news, device=device)
-
-    try:
-        news_cond = NewsConditioner(
-            news_excel_path=news_path,
-            target_date="2024-06-19",
-            d_news=d_news,
-            content_csv_path=content_csv if content_csv.exists() else None,
-            use_content=content_csv.exists(),
-        )
-        embeddings = news_cond.get_stock_embeddings(stock_codes)
-        if embeddings.size == 0:
-            return torch.zeros(d_news, device=device)
-        return torch.from_numpy(embeddings.mean(axis=0)).float().to(device)
-    except Exception as exc:
-        logger.warning("News conditioning unavailable: %s", exc)
-        return torch.zeros(d_news, device=device)
-
-
-class EncodedGridDataset(torch.utils.data.Dataset):
-    def __init__(self, encoded_grid: torch.Tensor, sequence_starts: list[int], total_frames: int):
+class EncodedRichSequenceDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        encoded_grid: torch.Tensor,
+        sequence_starts: list[int],
+        total_frames: int,
+        market_cond_grid: torch.Tensor,
+    ):
         self.encoded_grid = encoded_grid
         self.sequence_starts = sequence_starts
         self.total_frames = total_frames
+        self.market_cond_grid = market_cond_grid
 
     def __len__(self) -> int:
         return len(self.sequence_starts)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         start = self.sequence_starts[idx]
-        frames = self.encoded_grid[start:start + self.total_frames].float()
-        return {"frames": frames}
+        end = start + self.total_frames
+        return {
+            "frames": self.encoded_grid[start:end].float(),
+            "market_cond_grid": self.market_cond_grid[start:end],
+            "sequence_start": torch.tensor(start, dtype=torch.long),
+        }
+
+
+def build_decoder_targets(
+    raw_orders: torch.Tensor,
+    order_masks: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert raw-order features to RichOrderDecoder targets.
+
+    raw_orders:  [B, N_max, 10]
+    order_masks: [B, N_max]
+    """
+    targets = raw_orders.new_zeros(raw_orders.shape[0], raw_orders.shape[1], 10)
+    if raw_orders.shape[0] == 0:
+        return targets, order_masks.sum(dim=-1)
+
+    directions = raw_orders[..., 2]
+    dir_cls = torch.full_like(order_masks, 2, dtype=torch.long)
+    dir_cls = torch.where(directions > 0, torch.zeros_like(dir_cls), dir_cls)
+    dir_cls = torch.where(directions < 0, torch.ones_like(dir_cls), dir_cls)
+    targets[..., :3] = F.one_hot(dir_cls, num_classes=3).to(raw_orders.dtype)
+
+    order_types = raw_orders[..., 3].round().long().clamp(1, 3) - 1
+    targets[..., 5:8] = F.one_hot(order_types, num_classes=3).to(raw_orders.dtype)
+
+    targets[..., 3] = raw_orders[..., 0]                  # relative price
+    targets[..., 4] = raw_orders[..., 1]                  # log size
+    targets[..., 8] = raw_orders[..., 7].clamp(0.0, 1.0) # urgency proxy = aggressiveness
+    targets[..., 9] = order_masks.to(raw_orders.dtype)    # active flag
+
+    targets = targets * order_masks.unsqueeze(-1).to(raw_orders.dtype)
+    n_gt = order_masks.sum(dim=-1)
+    return targets, n_gt
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -120,8 +140,6 @@ MAX_STOCKS = env_int("MAX_STOCKS", 30)
 N_CLUSTERS = env_int("N_CLUSTERS", 10000)
 N_MAX_ORDERS = env_int("N_MAX_ORDERS", 16)
 WINDOW_SECONDS = env_float("WINDOW_SECONDS", 60.0)
-NEWS_DIM = env_int("NEWS_DIM", 32)
-TOTAL_MARKET_DIM = 8 + NEWS_DIM
 EVAL_ONLY = env_flag("EVAL_ONLY", False)
 RESUME = env_flag("RESUME", True)
 EVAL_BOTH = env_flag("EVAL_BOTH", True)
@@ -135,7 +153,17 @@ STRICT_MAX_MEAN_ABS = env_float("STRICT_MAX_MEAN_ABS", 0.10)
 DDIM_STEPS = env_int("DDIM_STEPS", 20)
 ALLOW_RANDOM_ENCODER = env_flag("ALLOW_RANDOM_ENCODER", False)
 
+ORDER_LOSS_WEIGHT = env_float("ORDER_LOSS_WEIGHT", 0.25)
+ORDER_LOSS_SAMPLES = env_int("ORDER_LOSS_SAMPLES", 512)
+ORDER_NEG_FRACTION = env_float("ORDER_NEG_FRACTION", 0.5)
+DECODER_D_MODEL = env_int("DECODER_D_MODEL", 128)
+DECODER_LAYERS = env_int("DECODER_LAYERS", 2)
+DECODER_HEADS = env_int("DECODER_HEADS", 4)
+DECODER_HIDDEN = env_int("DECODER_HIDDEN", 128)
+DECODER_QUERIES = env_int("DECODER_QUERIES", N_MAX_ORDERS)
+
 LATENT_CACHE_DIR = Path(os.getenv("LATENT_CACHE_DIR", "outputs/cache/ashare_10k_rich_latents"))
+RAW_CACHE_DIR = Path(os.getenv("RAW_CACHE_DIR", "outputs/cache/ashare_10k_rich_orders"))
 OUT_DIR = Path(os.getenv("OUT_DIR", "outputs/vdit_10k_rich_stage2"))
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -167,7 +195,8 @@ if not latent_cache_path.exists():
     )
 
 logger.info(
-    "Config: latent=%s d_model=%d depth=%d heads=%d patch=%d batch=%d eval_only=%s resume=%s",
+    "Config: latent=%s d_model=%d depth=%d heads=%d patch=%d batch=%d eval_only=%s resume=%s "
+    "order_loss_weight=%.3f order_loss_samples=%d",
     latent_cache_path,
     D_MODEL,
     DEPTH,
@@ -176,12 +205,13 @@ logger.info(
     BATCH_SIZE,
     EVAL_ONLY,
     RESUME,
+    ORDER_LOSS_WEIGHT,
+    ORDER_LOSS_SAMPLES,
 )
 
 latent_cache = torch.load(latent_cache_path, map_location="cpu", weights_only=False)
 encoded_grid = latent_cache["encoded_grid"]
 sequence_starts = list(latent_cache["sequence_starts"])
-stock_codes = list(latent_cache.get("stock_codes", []))
 logger.info(
     "Loaded latent cache: grid=%s sequences=%d cell_semantics=%s",
     tuple(encoded_grid.shape),
@@ -189,9 +219,42 @@ logger.info(
     latent_cache.get("cell_semantics", "unknown"),
 )
 
-dataset = EncodedGridDataset(encoded_grid, sequence_starts, total_frames=TOTAL_FRAMES)
+latent_cfg = latent_cache.get("config", {})
+raw_data_dir = latent_cfg.get("data_dir", os.getenv("DATA_DIR", "data/external/20240619"))
+raw_dataset = AShare10KRichOrderDataset(
+    raw_data_dir,
+    total_frames=TOTAL_FRAMES,
+    cond_frames=COND_FRAMES,
+    window_seconds=WINDOW_SECONDS,
+    max_stocks=MAX_STOCKS,
+    n_clusters=N_CLUSTERS,
+    grid_h=GRID_H,
+    grid_w=GRID_W,
+    n_max_orders=N_MAX_ORDERS,
+    cache_dir=RAW_CACHE_DIR,
+    use_cache=True,
+)
+if len(raw_dataset) == 0:
+    raise RuntimeError("AShare10KRichOrderDataset is empty")
+if list(raw_dataset.sequence_starts) != sequence_starts:
+    raise RuntimeError("Raw rich-order dataset sequence starts do not match latent cache")
+
+TOTAL_MARKET_DIM = int(raw_dataset.market_cond_grid.shape[-1]) if raw_dataset.market_cond_grid.numel() else 40
+logger.info(
+    "Loaded rich-order cache: raw_grid=%s market_cond_grid=%s market_cond_dim=%d",
+    tuple(raw_dataset.raw_order_grid.shape),
+    tuple(raw_dataset.market_cond_grid.shape),
+    TOTAL_MARKET_DIM,
+)
+
+dataset = EncodedRichSequenceDataset(
+    encoded_grid=encoded_grid,
+    sequence_starts=sequence_starts,
+    total_frames=TOTAL_FRAMES,
+    market_cond_grid=raw_dataset.market_cond_grid,
+)
 if len(dataset) == 0:
-    raise RuntimeError("EncodedGridDataset is empty")
+    raise RuntimeError("EncodedRichSequenceDataset is empty")
 
 loader = None
 if not EVAL_ONLY:
@@ -202,16 +265,6 @@ if not EVAL_ONLY:
         num_workers=NUM_WORKERS,
         drop_last=True,
     )
-
-news_mean = build_news_mean(stock_codes, device, NEWS_DIM)
-logger.info("News mean norm: %.4f", news_mean.norm().item())
-
-
-def build_market_cond(batch_size: int) -> torch.Tensor:
-    market = torch.zeros(batch_size, 8, device=device)
-    news = news_mean.unsqueeze(0).expand(batch_size, -1)
-    return torch.cat([market, news], dim=-1)
-
 
 model = VideoDiT(
     d_latent=D_LATENT,
@@ -228,11 +281,34 @@ model = VideoDiT(
     causal_temporal=True,
     alibi_temporal=True,
 ).to(device)
-logger.info("Model params: %.2fM", sum(p.numel() for p in model.parameters()) / 1e6)
+logger.info("VideoDiT params: %.2fM", sum(p.numel() for p in model.parameters()) / 1e6)
 
 if n_gpus > 1:
     model = nn.DataParallel(model)
     logger.info("VideoDiT DataParallel across %d GPUs", n_gpus)
+
+decoder = RichOrderDecoder(
+    d_state=D_LATENT,
+    d_model=DECODER_D_MODEL,
+    n_queries=DECODER_QUERIES,
+    n_layers=DECODER_LAYERS,
+    n_heads=DECODER_HEADS,
+    d_hidden=DECODER_HIDDEN,
+    dropout=0.0,
+).to(device)
+logger.info("RichOrderDecoder params: %.2fM", sum(p.numel() for p in decoder.parameters()) / 1e6)
+
+if e2e_ckpts:
+    try:
+        e2e_ckpt = torch.load(str(e2e_ckpts[-1]), map_location="cpu", weights_only=False)
+        decoder_state = e2e_ckpt.get("decoder")
+        if decoder_state is not None:
+            decoder.load_state_dict(decoder_state, strict=False)
+            logger.info("Warm-started decoder from %s", e2e_ckpts[-1])
+    except Exception as exc:
+        logger.warning("Could not warm-start decoder from %s: %s", e2e_ckpts[-1], exc)
+
+order_loss_fn = RichOrderLoss()
 
 
 def unwrap(module: nn.Module) -> nn.Module:
@@ -240,7 +316,8 @@ def unwrap(module: nn.Module) -> nn.Module:
 
 
 noise_sched = NoiseScheduler(1000, "cosine").to(device)
-optimizer = torch.optim.AdamW(unwrap(model).parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+train_params = list(unwrap(model).parameters()) + list(decoder.parameters())
+optimizer = torch.optim.AdamW(train_params, lr=LR, weight_decay=WEIGHT_DECAY)
 for group in optimizer.param_groups:
     group.setdefault("initial_lr", group["lr"])
 lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=TOTAL_STEPS)
@@ -259,6 +336,7 @@ def save_checkpoint(step: int) -> Path:
         {
             "dit": unwrap(model).state_dict(),
             "ema_dit": ema_state,
+            "decoder": decoder.state_dict(),
             "optimizer": optimizer.state_dict(),
             "lr_scheduler": lr_scheduler.state_dict(),
             "step": step,
@@ -277,6 +355,8 @@ def save_checkpoint(step: int) -> Path:
                 "n_clusters": N_CLUSTERS,
                 "n_max_orders": N_MAX_ORDERS,
                 "window_seconds": WINDOW_SECONDS,
+                "market_cond_dim": TOTAL_MARKET_DIM,
+                "order_loss_weight": ORDER_LOSS_WEIGHT,
                 "cell_semantics": latent_cache.get("cell_semantics", "behavioral_archetype_cluster"),
             },
         },
@@ -303,12 +383,105 @@ def load_checkpoint(path: Path, for_training: bool) -> int:
     else:
         ema_state = {k: v.clone() for k, v in unwrap(model).state_dict().items()}
 
+    decoder_state = ckpt.get("decoder")
+    if decoder_state is not None:
+        decoder.load_state_dict(decoder_state, strict=False)
+    elif for_training:
+        logger.warning("Checkpoint missing decoder state; keeping current decoder weights")
+
     if for_training and "optimizer" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer"])
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        except Exception as exc:
+            logger.warning("Could not load optimizer state from %s: %s", path, exc)
     if for_training and "lr_scheduler" in ckpt:
-        lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
+        try:
+            lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
+        except Exception as exc:
+            logger.warning("Could not load LR scheduler state from %s: %s", path, exc)
 
     return int(ckpt.get("step", 0))
+
+
+def compute_order_supervision(
+    sequence_starts: torch.Tensor,
+    z_cond: torch.Tensor,
+    z0_pred: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    if ORDER_LOSS_WEIGHT <= 0 or ORDER_LOSS_SAMPLES <= 0:
+        zero = z0_pred.new_tensor(0.0)
+        return {
+            "direction": zero,
+            "price": zero,
+            "size": zero,
+            "type": zero,
+            "urgency": zero,
+            "active": zero,
+            "total": zero,
+        }
+
+    B, N, H, W, D = z0_pred.shape
+    cells = H * W
+    starts_cpu = sequence_starts.cpu()
+
+    active_masks = []
+    for start in starts_cpu.tolist():
+        seq_masks = raw_dataset.mask_grid[start + COND_FRAMES:start + TOTAL_FRAMES]
+        active_masks.append(seq_masks.reshape(N, cells, N_MAX_ORDERS).any(dim=-1))
+    active_mask = torch.stack(active_masks, dim=0)  # [B, N, cells]
+
+    active_idx = active_mask.nonzero(as_tuple=False)
+    inactive_idx = (~active_mask).nonzero(as_tuple=False)
+
+    n_total = min(ORDER_LOSS_SAMPLES, int(active_mask.numel()))
+    n_neg_target = int(round(n_total * ORDER_NEG_FRACTION))
+    n_pos = min(active_idx.shape[0], max(n_total - n_neg_target, 0))
+    n_neg = min(inactive_idx.shape[0], max(n_total - n_pos, 0))
+
+    if n_pos + n_neg == 0:
+        zero = z0_pred.new_tensor(0.0)
+        return {
+            "direction": zero,
+            "price": zero,
+            "size": zero,
+            "type": zero,
+            "urgency": zero,
+            "active": zero,
+            "total": zero,
+        }
+
+    def _sample_rows(indices: torch.Tensor, count: int) -> torch.Tensor:
+        if count <= 0 or indices.shape[0] == 0:
+            return indices[:0]
+        perm = torch.randperm(indices.shape[0])[:count]
+        return indices[perm]
+
+    sampled = torch.cat([
+        _sample_rows(active_idx, n_pos),
+        _sample_rows(inactive_idx, n_neg),
+    ], dim=0)
+
+    b_cpu = sampled[:, 0]
+    n_cpu = sampled[:, 1]
+    c_cpu = sampled[:, 2]
+    row_cpu = c_cpu // GRID_W
+    col_cpu = c_cpu % GRID_W
+    frame_cpu = starts_cpu[b_cpu] + COND_FRAMES + n_cpu
+
+    target_raw = raw_dataset.raw_order_grid[frame_cpu, row_cpu, col_cpu].float().to(device)
+    target_masks = raw_dataset.mask_grid[frame_cpu, row_cpu, col_cpu].to(device)
+    target_orders, n_gt = build_decoder_targets(target_raw, target_masks)
+
+    prev_states = torch.cat([z_cond[:, -1:], z0_pred[:, :-1]], dim=1).reshape(B, N, cells, D)
+    curr_states = z0_pred.reshape(B, N, cells, D)
+    b = b_cpu.to(device)
+    n = n_cpu.to(device)
+    c = c_cpu.to(device)
+    pred_prev = prev_states[b, n, c]
+    pred_curr = curr_states[b, n, c]
+    pred_orders = decoder(pred_prev, pred_curr)
+
+    return order_loss_fn(pred_orders, target_orders, n_gt.to(device))
 
 
 start_step = 0
@@ -339,14 +512,15 @@ def run_eval(eval_ckpt: Path | None, anchor_state_stats: bool) -> Path:
 
     sampler = VideoDDIMSampler(unwrap(model), noise_sched, "v_prediction", ddim_steps=DDIM_STEPS, eta=0.0)
     seed_item = dataset[EVAL_SEED_INDEX]
-    seed = seed_item["frames"][:COND_FRAMES]
+    seed = seed_item["frames"][:COND_FRAMES].to(device)
+    seed_market_cond = seed_item["market_cond_grid"].unsqueeze(0).float().to(device)
     sim = InteractiveSimulator(
         unwrap(model),
         sampler,
         num_cond=COND_FRAMES,
         num_gen=TOTAL_FRAMES - COND_FRAMES,
         zero_sum_proj=True,
-        market_cond=build_market_cond(1),
+        market_cond=seed_market_cond,
         anchor_state_stats=anchor_state_stats,
     )
     sim.init(seed)
@@ -389,6 +563,7 @@ def run_eval(eval_ckpt: Path | None, anchor_state_stats: bool) -> Path:
         "latent_cache_path": str(latent_cache_path),
         "anchor_state_stats": anchor_state_stats,
         "cell_semantics": latent_cache.get("cell_semantics", "behavioral_archetype_cluster"),
+        "conditioning_shape": list(seed_market_cond.shape),
         "seed_mean": seed_mean,
         "seed_std": seed_std,
         "strict_thresholds": {
@@ -425,7 +600,11 @@ if not EVAL_ONLY and start_step < TOTAL_STEPS:
         for batch in loader:
             if step >= TOTAL_STEPS:
                 break
+
             frames = batch["frames"].to(device)
+            market_cond_grid = batch["market_cond_grid"].float().to(device)
+            sequence_start = batch["sequence_start"]
+
             B, T, H, W, C = frames.shape
             N = T - K
             z_cond, z_gen = frames[:, :K], frames[:, K:]
@@ -438,17 +617,26 @@ if not EVAL_ONLY and start_step < TOTAL_STEPS:
                 noise.reshape(B * N, H, W, C),
             ).reshape(B, N, H, W, C)
 
-            v_pred = model(z_cond, z_noisy, t_diff, market_cond=build_market_cond(B))
+            v_pred = model(z_cond, z_noisy, t_diff, market_cond=market_cond_grid)
             v_target = noise_sched.v_target(
                 z_gen.reshape(B * N, H, W, C),
                 noise.reshape(B * N, H, W, C),
                 t_exp,
             ).reshape(B, N, H, W, C)
-            loss = F.mse_loss(v_pred, v_target)
+            loss_diff = F.mse_loss(v_pred, v_target)
+
+            z0_pred = noise_sched.predict_x0_from_v(
+                z_noisy.reshape(B * N, H, W, C),
+                t_exp,
+                v_pred.reshape(B * N, H, W, C),
+            ).reshape(B, N, H, W, C)
+            order_loss = compute_order_supervision(sequence_start, z_cond, z0_pred)
+            loss_order = order_loss["total"]
+            loss = loss_diff + ORDER_LOSS_WEIGHT * loss_order
 
             optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(unwrap(model).parameters(), 1.0)
+            nn.utils.clip_grad_norm_(train_params, 1.0)
             optimizer.step()
             lr_scheduler.step()
             update_ema()
@@ -458,6 +646,9 @@ if not EVAL_ONLY and start_step < TOTAL_STEPS:
             if step % LOG_EVERY == 0:
                 pbar.set_postfix(
                     loss=f"{loss.item():.4f}",
+                    diff=f"{loss_diff.item():.4f}",
+                    order=f"{loss_order.item():.4f}",
+                    active=f"{order_loss['active'].item():.4f}",
                     lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
                     step=step,
                 )
@@ -467,7 +658,12 @@ if not EVAL_ONLY and start_step < TOTAL_STEPS:
     pbar.close()
     last_saved_ckpt = save_checkpoint(step)
     elapsed = time.time() - train_start
-    logger.info("Training done: %d steps in %.0fs (%.2f steps/s)", step, elapsed, max(step - start_step, 1) / max(elapsed, 1e-6))
+    logger.info(
+        "Training done: %d steps in %.0fs (%.2f steps/s)",
+        step,
+        elapsed,
+        max(step - start_step, 1) / max(elapsed, 1e-6),
+    )
 
 if last_saved_ckpt is None:
     last_saved_ckpt = train_ckpt_path

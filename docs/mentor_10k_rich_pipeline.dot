@@ -1,0 +1,289 @@
+digraph Mentor10KRichPipeline {
+  graph [
+    rankdir=TB,
+    splines=true,
+    pad=0.40,
+    nodesep=0.38,
+    ranksep=0.62,
+    bgcolor="#faf7f0",
+    fontname="Helvetica",
+    label=<
+      <TABLE BORDER="0" CELLBORDER="0" CELLPADDING="2">
+        <TR><TD><FONT POINT-SIZE="22"><B>10K-Scale Generative Agent Interaction Simulation</B></FONT></TD></TR>
+        <TR><TD><FONT POINT-SIZE="12" COLOR="#475467">Real A-share L3 orders + time-varying news to behavioral archetype field to latent video dynamics to interactive surrogate simulation</FONT></TD></TR>
+      </TABLE>
+    >,
+    labelloc=t
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Helvetica",
+    fontsize=12,
+    margin="0.15,0.11",
+    color="#475467",
+    penwidth=1.2,
+    fillcolor="#ffffff"
+  ];
+
+  edge [
+    color="#667085",
+    penwidth=1.45,
+    arrowsize=0.8,
+    fontname="Helvetica",
+    fontsize=10
+  ];
+
+  question [shape=plain, label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="10" COLOR="#16324f" BGCOLOR="#1f4d78">
+      <TR><TD><FONT COLOR="white" POINT-SIZE="16"><B>Research Question</B></FONT></TD></TR>
+      <TR><TD BGCOLOR="#f8fbff"><FONT COLOR="#101828">Can we replace expensive explicit 10k-agent market rollouts</FONT><BR/><FONT COLOR="#101828">with a learned generative surrogate that still supports rollout, intervention, and counterfactual analysis?</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  formulation [shape=plain, label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="10" COLOR="#7c2d12" BGCOLOR="#b45309">
+      <TR><TD><FONT COLOR="white" POINT-SIZE="15"><B>Core Reframing</B></FONT></TD></TR>
+      <TR><TD BGCOLOR="#fff7ed"><FONT COLOR="#101828">Treat market evolution as a spatiotemporal video of behavior fields,</FONT><BR/><FONT COLOR="#101828">not as explicit per-agent message passing or event-by-event simulation.</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  subgraph cluster_data {
+    label="1. Real Data and Conditioning";
+    color="#c7d7fe";
+    penwidth=1.5;
+    style="rounded,filled";
+    fillcolor="#eef4ff";
+
+    l3_data [label=<
+      <B>A-share L3 orders</B><BR ALIGN="LEFT"/>
+      2024-06-19, top 30 active stocks<BR ALIGN="LEFT"/>
+      tick-level order / cancel / execution data
+    >];
+
+    pool_orders [label=<
+      <B>Pool orders across stocks</B><BR ALIGN="LEFT"/>
+      unify price, size, side,<BR ALIGN="LEFT"/>
+      order type, timestamp, stock id
+    >];
+
+    rich_feats [label=<
+      <B>Per-order rich features</B><BR ALIGN="LEFT"/>
+      relative price, log size, direction,<BR ALIGN="LEFT"/>
+      type, aggressiveness, execution,<BR ALIGN="LEFT"/>
+      cancel, time gap, size percentile
+    >];
+
+    market_ctx [label=<
+      <B>8-d market context</B><BR ALIGN="LEFT"/>
+      built from real L3 snapshots<BR ALIGN="LEFT"/>
+      per stock, per time window
+    >, fillcolor="#f8fbff"];
+
+    news_ctx [label=<
+      <B>32-d time-varying news context</B><BR ALIGN="LEFT"/>
+      per stock, cumulative up to each window edge<BR ALIGN="LEFT"/>
+      no longer one static daily mean vector
+    >, fillcolor="#f8fbff"];
+
+    { rank=same; l3_data; pool_orders; rich_feats; }
+    { rank=same; market_ctx; news_ctx; }
+  }
+
+  subgraph cluster_rep {
+    label="2. Behavioral Field Representation";
+    color="#b8e3d3";
+    penwidth=1.5;
+    style="rounded,filled";
+    fillcolor="#edfdf3";
+
+    cluster_10k [label=<
+      <B>10k behavioral archetypes</B><BR ALIGN="LEFT"/>
+      cluster pooled order behavior<BR ALIGN="LEFT"/>
+      into reusable microstructure patterns
+    >];
+
+    grid_layout [label=<
+      <B>100 x 100 semantic grid</B><BR ALIGN="LEFT"/>
+      nearby cells host similar<BR ALIGN="LEFT"/>
+      behavior archetypes
+    >];
+
+    raw_grid [label=<
+      <B>Rich order grid</B><BR ALIGN="LEFT"/>
+      [T, H, W, N_max, 10]<BR ALIGN="LEFT"/>
+      each cell keeps up to 16 raw orders
+    >];
+
+    cond_grid [label=<
+      <B>Condition grid</B><BR ALIGN="LEFT"/>
+      [T, H, W, 40] = 8 market + 32 news<BR ALIGN="LEFT"/>
+      weighted by stock activity inside each cell
+    >, fillcolor="#f6fffb"];
+
+    encoder [label=<
+      <B>RichAgentEncoder</B><BR ALIGN="LEFT"/>
+      raw order sequence to 64-d latent state<BR ALIGN="LEFT"/>
+      learned first on a smaller rich setup
+    >];
+
+    latent_cache [label=<
+      <B>Latent market video cache</B><BR ALIGN="LEFT"/>
+      [T, 100, 100, 64]<BR ALIGN="LEFT"/>
+      fast reusable Stage 2 training target
+    >];
+
+    { rank=same; cluster_10k; grid_layout; raw_grid; }
+    { rank=same; cond_grid; encoder; latent_cache; }
+  }
+
+  subgraph cluster_train {
+    label="3. Dynamics Learning";
+    color="#f4c994";
+    penwidth=1.5;
+    style="rounded,filled";
+    fillcolor="#fff7e8";
+
+    stage2 [label=<
+      <B>Video DiT Stage 2</B><BR ALIGN="LEFT"/>
+      input: 4 real latent frames<BR ALIGN="LEFT"/>
+      generate: next 16 latent frames
+    >];
+
+    token_cond [label=<
+      <B>Condition injection</B><BR ALIGN="LEFT"/>
+      supports global, per-frame,<BR ALIGN="LEFT"/>
+      or full [T,H,W,C] condition tokens
+    >, fillcolor="#fffdfa"];
+
+    diff_obj [label=<
+      <B>Latent diffusion objective</B><BR ALIGN="LEFT"/>
+      v-prediction on latent video dynamics
+    >];
+
+    decoder [label=<
+      <B>RichOrderDecoder</B><BR ALIGN="LEFT"/>
+      latent transition to order semantics<BR ALIGN="LEFT"/>
+      warm-started from rich E2E checkpoint
+    >, fillcolor="#fffdfa"];
+
+    order_loss [label=<
+      <B>Closed-loop order supervision</B><BR ALIGN="LEFT"/>
+      sampled order reconstruction loss<BR ALIGN="LEFT"/>
+      ties latent rollout back to raw order meaning
+    >, fillcolor="#fffdfa"];
+
+    train_state [label=<
+      <B>Training status</B><BR ALIGN="LEFT"/>
+      5-GPU DataParallel full run<BR ALIGN="LEFT"/>
+      checkpoints + raw / anchor eval
+    >];
+
+    { rank=same; stage2; token_cond; }
+    { rank=same; diff_obj; decoder; order_loss; }
+  }
+
+  subgraph cluster_sim {
+    label="4. Interactive Surrogate Simulation";
+    color="#d6bbfb";
+    penwidth=1.5;
+    style="rounded,filled";
+    fillcolor="#f9f5ff";
+
+    rollout [label=<
+      <B>Sliding-window rollout</B><BR ALIGN="LEFT"/>
+      reuse generated tail as next condition<BR ALIGN="LEFT"/>
+      for long-horizon simulation
+    >];
+
+    intervene [label=<
+      <B>Intervention interface</B><BR ALIGN="LEFT"/>
+      shock local cells, edit states,<BR ALIGN="LEFT"/>
+      or alter conditions mid-rollout
+    >];
+
+    why_sim [label=<
+      <B>Why this counts as interaction simulation</B><BR ALIGN="LEFT"/>
+      model learns joint field evolution,<BR ALIGN="LEFT"/>
+      supports rollout and counterfactual response,<BR ALIGN="LEFT"/>
+      acts as a surrogate ABM
+    >];
+  }
+
+  subgraph cluster_limits {
+    label="5. Remaining Limits";
+    color="#f4b4b4";
+    penwidth=1.5;
+    style="rounded,filled";
+    fillcolor="#fff1f2";
+
+    gap_identity [label=<
+      <B>No persistent real-agent identity</B><BR ALIGN="LEFT"/>
+      a cell is a behavior archetype,<BR ALIGN="LEFT"/>
+      not one traceable trader over time
+    >];
+
+    gap_execution [label=<
+      <B>No explicit matching engine</B><BR ALIGN="LEFT"/>
+      still not a full execution-level simulator<BR ALIGN="LEFT"/>
+      with order-book update mechanics
+    >];
+
+    gap_coverage [label=<
+      <B>Coverage is still narrow</B><BR ALIGN="LEFT"/>
+      current full experiment focuses on<BR ALIGN="LEFT"/>
+      one day and 30 active stocks
+    >];
+
+    gap_eval [label=<
+      <B>Evidence is not closed yet</B><BR ALIGN="LEFT"/>
+      final 20k training, stylized facts,<BR ALIGN="LEFT"/>
+      intervention tests, and cross-day generalization remain
+    >];
+
+    { rank=same; gap_identity; gap_execution; gap_coverage; gap_eval; }
+  }
+
+  outcome [shape=plain, label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="10" COLOR="#0f766e" BGCOLOR="#0b8f87">
+      <TR><TD><FONT COLOR="white" POINT-SIZE="15"><B>Current Takeaway</B></FONT></TD></TR>
+      <TR><TD BGCOLOR="#ecfeff"><FONT COLOR="#0f172a">We now have a working 10k-scale pipeline:</FONT><BR/><FONT COLOR="#0f172a">real market data to rich behavioral field to latent video dynamics to intervention-ready surrogate simulation.</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  question -> formulation;
+
+  formulation -> l3_data;
+  l3_data -> pool_orders;
+  pool_orders -> rich_feats;
+  l3_data -> market_ctx;
+  l3_data -> news_ctx [style=dashed];
+
+  rich_feats -> cluster_10k;
+  cluster_10k -> grid_layout;
+  grid_layout -> raw_grid;
+  market_ctx -> cond_grid;
+  news_ctx -> cond_grid;
+  raw_grid -> encoder;
+  encoder -> latent_cache;
+
+  latent_cache -> stage2;
+  cond_grid -> token_cond;
+  token_cond -> stage2;
+  stage2 -> diff_obj;
+  stage2 -> decoder;
+  decoder -> order_loss;
+  diff_obj -> train_state;
+  order_loss -> train_state;
+
+  train_state -> rollout;
+  rollout -> intervene;
+  intervene -> why_sim;
+  why_sim -> outcome;
+
+  why_sim -> gap_identity [style=dashed, color="#c2410c"];
+  rollout -> gap_execution [style=dashed, color="#c2410c"];
+  train_state -> gap_coverage [style=dashed, color="#c2410c"];
+  outcome -> gap_eval [style=dashed, color="#c2410c"];
+}

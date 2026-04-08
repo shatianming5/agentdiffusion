@@ -150,6 +150,42 @@ def test_ddim_sample():
     assert sample.shape == (1, 16, 16, 16)
 
 
+def test_video_dit_condition_shapes():
+    from agentdiffusion.models.video_dit import VideoDiT
+
+    B, K, N = 2, 2, 3
+    H, W, C = 8, 8, 16
+    cond_dim = 12
+    model = VideoDiT(
+        d_latent=C,
+        d_model=64,
+        depth=2,
+        heads=4,
+        patch_size=2,
+        grid_h=H,
+        grid_w=W,
+        num_frames=K + N,
+        num_cond_frames=K,
+        market_cond_dim=cond_dim,
+    )
+
+    x_cond = torch.randn(B, K, H, W, C)
+    x_noisy = torch.randn(B, N, H, W, C)
+    t = torch.randint(0, 1000, (B,))
+
+    global_cond = torch.randn(B, cond_dim)
+    out = model(x_cond, x_noisy, t, market_cond=global_cond)
+    assert out.shape == (B, N, H, W, C)
+
+    frame_cond = torch.randn(B, K + N, cond_dim)
+    out = model(x_cond, x_noisy, t, market_cond=frame_cond)
+    assert out.shape == (B, N, H, W, C)
+
+    grid_cond = torch.randn(B, K + N, H, W, cond_dim)
+    out = model(x_cond, x_noisy, t, market_cond=grid_cond)
+    assert out.shape == (B, N, H, W, C)
+
+
 def test_constraint_loss():
     from agentdiffusion.constraints.soft_loss import ConstraintLoss
 

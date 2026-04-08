@@ -24,8 +24,10 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
+from .ashare_l3_dataset import build_market_conditions, load_stock_l3
 from .ashare_10k_agents import arrange_grid_2d, cluster_agents, extract_order_features
 from .ashare_stock_agents import CLOSE_SEC, OPEN_SEC
+from .news_conditioning import NewsConditioner
 from ..models.rich_agent_encoder import D_RAW_ORDER, _map_order_type
 
 logger = logging.getLogger(__name__)
@@ -33,7 +35,21 @@ logger = logging.getLogger(__name__)
 GRID_H = 100
 GRID_W = 100
 N_CLUSTERS = 10000
-MARKET_COND_DIM = 40
+MARKET_BASE_DIM = 8
+NEWS_DIM = 32
+MARKET_COND_DIM = MARKET_BASE_DIM + NEWS_DIM
+
+
+def _select_stock_dirs(data_dir: str | Path, max_stocks: int) -> list[Path]:
+    data_dir = Path(data_dir)
+    return sorted([d for d in data_dir.iterdir() if d.is_dir()])[:max_stocks]
+
+
+def _infer_target_date(data_dir: str | Path) -> str:
+    raw = "".join(ch for ch in Path(data_dir).name if ch.isdigit())
+    if len(raw) >= 8:
+        return f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+    return "2024-06-19"
 
 
 def _dataset_cache_path(
@@ -67,10 +83,9 @@ def load_orders_multi_stock_with_codes(
     data_dir: str | Path,
     max_stocks: int = 30,
     encoding: str = "gbk",
-) -> tuple[pd.DataFrame, list[str]]:
+) -> tuple[pd.DataFrame, list[str], list[Path]]:
     """Load pooled orders from multiple stocks and preserve stock-code metadata."""
-    data_dir = Path(data_dir)
-    stock_dirs = sorted([d for d in data_dir.iterdir() if d.is_dir()])[:max_stocks]
+    stock_dirs = _select_stock_dirs(data_dir, max_stocks)
     stock_codes = [sd.name for sd in stock_dirs]
 
     all_orders = []
@@ -132,11 +147,53 @@ def load_orders_multi_stock_with_codes(
             logger.warning("Failed %s: %s", sd.name, exc)
 
     if not all_orders:
-        return pd.DataFrame(), stock_codes
+        return pd.DataFrame(), stock_codes, stock_dirs
 
     combined = pd.concat(all_orders, ignore_index=True)
     logger.info("Pooled %d orders from %d stocks", len(combined), len(all_orders))
-    return combined, stock_codes
+    return combined, stock_codes, stock_dirs
+
+
+def _load_stock_market_context(
+    stock_dirs: list[Path],
+    time_edges: np.ndarray,
+) -> np.ndarray:
+    """Load per-stock, per-window 8-d market conditions from real snapshots."""
+    n_stocks = len(stock_dirs)
+    n_windows = len(time_edges) - 1
+    market = np.zeros((n_stocks, n_windows, MARKET_BASE_DIM), dtype=np.float32)
+
+    for stock_idx, stock_dir in enumerate(stock_dirs):
+        try:
+            snapshots = load_stock_l3(stock_dir)["snapshots"]
+            market[stock_idx] = build_market_conditions(snapshots, time_edges)
+        except Exception as exc:
+            logger.warning("Failed loading market context from %s: %s", stock_dir.name, exc)
+
+    return market
+
+
+def _load_stock_news_context(
+    stock_codes: list[str],
+    time_edges: np.ndarray,
+    data_dir: str | Path,
+) -> np.ndarray:
+    """Load per-stock, per-window 32-d news embeddings."""
+    news_path = Path("data/external/news/2024_News_Security.xlsx")
+    content_csv = Path("data/external/news/news_20240619_with_content.csv")
+    if not news_path.exists():
+        logger.warning("News file missing: %s", news_path)
+        return np.zeros((len(stock_codes), len(time_edges) - 1, NEWS_DIM), dtype=np.float32)
+
+    news_cond = NewsConditioner(
+        news_excel_path=news_path,
+        target_date=_infer_target_date(data_dir),
+        d_news=NEWS_DIM,
+        content_csv_path=content_csv if content_csv.exists() else None,
+        use_content=content_csv.exists(),
+    )
+    ts_embeddings = news_cond.get_stock_time_series_embeddings(stock_codes, time_edges)
+    return np.transpose(ts_embeddings, (1, 0, 2)).astype(np.float32)
 
 
 def _compute_per_order_mid_prices(
@@ -298,6 +355,101 @@ def _build_rich_cluster_order_grid(
     return order_grid, mask_grid
 
 
+def _build_market_condition_grid(
+    orders: pd.DataFrame,
+    labels: np.ndarray,
+    grid_pos: np.ndarray,
+    time_edges: np.ndarray,
+    stock_market_conds: np.ndarray,
+    stock_news_conds: np.ndarray,
+    grid_h: int,
+    grid_w: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build time-varying cell-level [T, H, W, 40] conditioning grid.
+
+    Each cell/window gets a stock-mixture-weighted combination of:
+    - 8-d real market microstructure features from snapshots
+    - 32-d cumulative news embeddings up to that window
+    """
+    n_windows = len(time_edges) - 1
+    n_stocks = stock_market_conds.shape[0]
+    if len(orders) == 0 or n_windows <= 0 or n_stocks == 0:
+        zeros_grid = np.zeros((max(n_windows, 0), grid_h, grid_w, MARKET_COND_DIM), dtype=np.float32)
+        zeros_global = np.zeros((max(n_windows, 0), MARKET_COND_DIM), dtype=np.float32)
+        return zeros_grid, zeros_global
+
+    ts = orders["timestamp"].to_numpy(dtype=np.float64)
+    t_bins = np.digitize(ts, time_edges) - 1
+    t_bins = np.clip(t_bins, 0, n_windows - 1)
+    rows = grid_pos[labels, 0]
+    cols = grid_pos[labels, 1]
+    stock_idx = orders["stock_idx"].to_numpy(dtype=np.int64)
+    weights = np.log1p(np.clip(orders["size"].to_numpy(dtype=np.float64), 0.0, None)).astype(np.float32)
+
+    activity = pd.DataFrame(
+        {
+            "time_bin": t_bins.astype(np.int64),
+            "row": rows.astype(np.int64),
+            "col": cols.astype(np.int64),
+            "stock_idx": stock_idx,
+            "weight": weights,
+        }
+    )
+    grouped = (
+        activity.groupby(["time_bin", "row", "col", "stock_idx"], sort=False)["weight"]
+        .sum()
+        .reset_index()
+    )
+    grouped_global = (
+        activity.groupby(["time_bin", "stock_idx"], sort=False)["weight"]
+        .sum()
+        .reset_index()
+    )
+
+    global_weights = np.zeros((n_windows, n_stocks), dtype=np.float32)
+    for row in grouped_global.itertuples(index=False):
+        global_weights[int(row.time_bin), int(row.stock_idx)] = float(row.weight)
+
+    default_weights = np.full((n_stocks,), 1.0 / max(n_stocks, 1), dtype=np.float32)
+    global_sums = global_weights.sum(axis=-1, keepdims=True)
+    global_weights = np.divide(
+        global_weights,
+        np.maximum(global_sums, 1e-6),
+        out=np.broadcast_to(default_weights, global_weights.shape).copy(),
+        where=global_sums > 0,
+    )
+
+    market_by_time_stock = np.transpose(stock_market_conds, (1, 0, 2))  # [T, S, 8]
+    news_by_time_stock = np.transpose(stock_news_conds, (1, 0, 2))      # [T, S, 32]
+    global_market = np.einsum("ts,tsc->tc", global_weights, market_by_time_stock)
+    global_news = np.einsum("ts,tsc->tc", global_weights, news_by_time_stock)
+    global_conds = np.concatenate([global_market, global_news], axis=-1).astype(np.float32)
+
+    cond_grid = np.broadcast_to(global_conds[:, None, None, :], (n_windows, grid_h, grid_w, MARKET_COND_DIM)).copy()
+    market_sum = np.zeros((n_windows, grid_h, grid_w, MARKET_BASE_DIM), dtype=np.float32)
+    news_sum = np.zeros((n_windows, grid_h, grid_w, NEWS_DIM), dtype=np.float32)
+    weight_sum = np.zeros((n_windows, grid_h, grid_w, 1), dtype=np.float32)
+
+    for row in grouped.itertuples(index=False):
+        t_idx = int(row.time_bin)
+        r_idx = int(row.row)
+        c_idx = int(row.col)
+        s_idx = int(row.stock_idx)
+        w = float(row.weight)
+        market_sum[t_idx, r_idx, c_idx] += w * stock_market_conds[s_idx, t_idx]
+        news_sum[t_idx, r_idx, c_idx] += w * stock_news_conds[s_idx, t_idx]
+        weight_sum[t_idx, r_idx, c_idx, 0] += w
+
+    active = weight_sum[..., 0] > 0
+    if active.any():
+        cell_market = market_sum / np.maximum(weight_sum, 1e-6)
+        cell_news = news_sum / np.maximum(weight_sum, 1e-6)
+        cell_conds = np.concatenate([cell_market, cell_news], axis=-1)
+        cond_grid[active] = cell_conds[active]
+
+    return cond_grid, global_conds
+
+
 class AShare10KRichOrderDataset(Dataset):
     """100x100 rich-order cluster dataset for cached-latent Stage 2."""
 
@@ -320,7 +472,10 @@ class AShare10KRichOrderDataset(Dataset):
         self.grid_h = grid_h
         self.grid_w = grid_w
         self.n_max_orders = n_max_orders
-        self.market_conds = torch.zeros(self.total_frames, MARKET_COND_DIM)
+        self.market_conds = torch.empty(0, MARKET_COND_DIM, dtype=torch.float32)
+        self.market_cond_grid = torch.empty(
+            0, grid_h, grid_w, MARKET_COND_DIM, dtype=torch.float16
+        )
         self.raw_order_grid = torch.empty(
             0, grid_h, grid_w, n_max_orders, D_RAW_ORDER, dtype=torch.float16
         )
@@ -343,18 +498,23 @@ class AShare10KRichOrderDataset(Dataset):
         if use_cache and self.cache_path.exists():
             logger.info("Loading cached 10K rich-order grid from %s", self.cache_path)
             cached = torch.load(self.cache_path, map_location="cpu", weights_only=False)
-            self.raw_order_grid = cached["raw_order_grid"]
-            self.mask_grid = cached["mask_grid"].bool()
-            self.sequence_starts = list(cached["sequence_starts"])
-            self.stock_codes = list(cached.get("stock_codes", []))
-            logger.info(
-                "Loaded cached rich-order grid: shape=%s, sequences=%d",
-                tuple(self.raw_order_grid.shape),
-                len(self.sequence_starts),
-            )
-            return
+            has_market = "market_cond_grid" in cached and "market_conds" in cached
+            if has_market:
+                self.raw_order_grid = cached["raw_order_grid"]
+                self.mask_grid = cached["mask_grid"].bool()
+                self.market_cond_grid = cached["market_cond_grid"].to(torch.float16)
+                self.market_conds = cached["market_conds"].float()
+                self.sequence_starts = list(cached["sequence_starts"])
+                self.stock_codes = list(cached.get("stock_codes", []))
+                logger.info(
+                    "Loaded cached rich-order grid: shape=%s, sequences=%d",
+                    tuple(self.raw_order_grid.shape),
+                    len(self.sequence_starts),
+                )
+                return
+            logger.info("Cached dataset missing time-varying conditioning. Rebuilding %s", self.cache_path)
 
-        orders, stock_codes = load_orders_multi_stock_with_codes(data_dir, max_stocks=max_stocks)
+        orders, stock_codes, stock_dirs = load_orders_multi_stock_with_codes(data_dir, max_stocks=max_stocks)
         self.stock_codes = stock_codes
         if orders.empty:
             logger.error("No orders loaded for AShare10KRichOrderDataset")
@@ -375,6 +535,8 @@ class AShare10KRichOrderDataset(Dataset):
             window_seconds,
             n_max_orders,
         )
+        stock_market_conds = _load_stock_market_context(stock_dirs, time_edges)
+        stock_news_conds = _load_stock_news_context(stock_codes, time_edges, data_dir)
         order_grid, mask_grid = _build_rich_cluster_order_grid(
             orders,
             labels,
@@ -385,9 +547,21 @@ class AShare10KRichOrderDataset(Dataset):
             grid_h=grid_h,
             grid_w=grid_w,
         )
+        market_cond_grid, market_conds = _build_market_condition_grid(
+            orders,
+            labels,
+            grid_pos,
+            time_edges,
+            stock_market_conds=stock_market_conds,
+            stock_news_conds=stock_news_conds,
+            grid_h=grid_h,
+            grid_w=grid_w,
+        )
 
         self.raw_order_grid = torch.from_numpy(order_grid)
         self.mask_grid = torch.from_numpy(mask_grid)
+        self.market_cond_grid = torch.from_numpy(market_cond_grid).to(torch.float16)
+        self.market_conds = torch.from_numpy(market_conds).float()
 
         stride = max(total_frames // 2, 1)
         self.sequence_starts = list(range(0, n_windows - total_frames + 1, stride))
@@ -406,6 +580,8 @@ class AShare10KRichOrderDataset(Dataset):
                 {
                     "raw_order_grid": self.raw_order_grid,
                     "mask_grid": self.mask_grid,
+                    "market_cond_grid": self.market_cond_grid,
+                    "market_conds": self.market_conds,
                     "sequence_starts": self.sequence_starts,
                     "stock_codes": self.stock_codes,
                     "config": {
@@ -445,5 +621,6 @@ class AShare10KRichOrderDataset(Dataset):
         return {
             "raw_orders": raw_orders,
             "order_masks": order_masks,
-            "market_conds": self.market_conds.clone(),
+            "market_conds": self.market_conds[start:end].clone(),
+            "market_cond_grid": self.market_cond_grid[start:end].clone(),
         }
